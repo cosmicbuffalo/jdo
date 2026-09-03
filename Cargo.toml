@@ -1,0 +1,27 @@
+[package]
+name = "jdo"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "A terminal UI client for Jira boards — a fork of tdo's TUI over the Jira Cloud REST API"
+repository = "https://github.com/cosmicbuffalo/jdo"
+
+[dependencies]
+# --- TUI (carried over from tdo) ---
+ratatui = "0.29"
+crossterm = "0.28"
+tui-textarea = "0.7"
+
+# --- serialization / config ---
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+clap = { version = "4", features = ["derive", "env"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# --- misc ---
+anyhow = "1"
+shlex = "1"
+
+# Network + clipboard deps (reqwest, base64, arboard) are added in P1/P4.
+# OAuth deps (oauth2, tiny_http, open) are added in P5.
