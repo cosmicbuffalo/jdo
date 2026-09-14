@@ -19,9 +19,13 @@ toml = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
 chrono = { version = "0.4", features = ["serde"] }
 
+# --- network (P1) ---
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+base64 = "0.22"
+
 # --- misc ---
 anyhow = "1"
 shlex = "1"
 
-# Network + clipboard deps (reqwest, base64, arboard) are added in P1/P4.
+# Clipboard dep (arboard) is added in P4.
 # OAuth deps (oauth2, tiny_http, open) are added in P5.

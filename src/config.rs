@@ -1,10 +1,13 @@
 //! Configuration.
 //!
-//! P0 defines the shape (with defaults seeded from the live field discovery on
-//! `your-site.atlassian.net`). File + env loading and validation land in P1, where
-//! the board is selected via `JDO_BOARD` / `[jira].board_id`. Secrets
-//! (`JIRA_API_TOKEN`, OAuth client creds) come from env only, never the file.
+//! Config lives at `$XDG_CONFIG_HOME/jdo/config.toml` (`[jira]` section);
+//! defaults are seeded from the live field discovery on `your-site.atlassian.net`.
+//! Board can be overridden by `--board` / `JDO_BOARD`. Secrets
+//! (`JIRA_EMAIL`, `JIRA_API_TOKEN`) come from the environment only.
 
+use std::path::PathBuf;
+
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,9 +30,8 @@ pub enum AuthKind {
     OAuth,
 }
 
-/// Custom-field id overrides. Empty by default — resolved at runtime from the
-/// project's field catalog / editmeta so jdo works across projects with
-/// differing ids. These seeds match project DEMO and act as fallbacks.
+/// Custom-field id overrides. Defaults match project DEMO and act as
+/// fallbacks; runtime resolution (P1.x) will prefer the project's own catalog.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FieldMap {
@@ -44,7 +46,9 @@ impl Default for JiraConfig {
         Self {
             base_url: "https://your-site.atlassian.net".into(),
             auth: AuthKind::ApiToken,
-            board_id: 0,
+            // Default to the team board so `cargo run` works out of the box;
+            // override with --board / JDO_BOARD / config.
+            board_id: 123,
             refresh_seconds: 25,
             fields: FieldMap::default(),
         }
@@ -60,4 +64,52 @@ impl Default for FieldMap {
             epic_link: "customfield_10014".into(),
         }
     }
+}
+
+/// API-token credentials pulled from the environment.
+pub struct Credentials {
+    pub email: String,
+    pub token: String,
+}
+
+/// Load config from file (if present) then apply env overrides.
+pub fn load() -> Result<JiraConfig> {
+    let mut cfg = read_file().unwrap_or_default();
+    if let Ok(url) = std::env::var("JIRA_BASE_URL") {
+        cfg.base_url = url;
+    }
+    if let Ok(board) = std::env::var("JDO_BOARD") {
+        if let Ok(id) = board.parse() {
+            cfg.board_id = id;
+        }
+    }
+    Ok(cfg)
+}
+
+fn read_file() -> Option<JiraConfig> {
+    let text = std::fs::read_to_string(config_path()?).ok()?;
+
+    #[derive(Default, Deserialize)]
+    struct Wrapper {
+        #[serde(default)]
+        jira: JiraConfig,
+    }
+
+    let wrapper: Wrapper = toml::from_str(&text).ok()?;
+    Some(wrapper.jira)
+}
+
+fn config_path() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
+    Some(base.join("jdo").join("config.toml"))
+}
+
+pub fn credentials() -> Result<Credentials> {
+    let email = std::env::var("JIRA_EMAIL")
+        .map_err(|_| anyhow!("JIRA_EMAIL is not set (required for API-token auth)"))?;
+    let token = std::env::var("JIRA_API_TOKEN")
+        .map_err(|_| anyhow!("JIRA_API_TOKEN is not set"))?;
+    Ok(Credentials { email, token })
 }
