@@ -11,25 +11,34 @@ use std::thread::{self, JoinHandle};
 use serde_json::Value;
 
 use crate::config::FieldMap;
-use crate::jira::client::JiraClient;
+use crate::jira::client::{JiraClient, JiraError};
 use crate::jira::mapping;
-use crate::model::Board;
+use crate::model::{Board, Comment, Issue, RawFields, Transition};
 
 /// UI → worker requests.
 pub enum Command {
     LoadBoard { board_id: u64 },
-    RefreshIssue { key: String },
-    Transition { key: String, transition_id: String, fields: Value },
-    UpdateField { key: String, field_id: String, value: Value },
-    AddComment { key: String, body: Value },
+    /// Workflow transitions from the issue's current status, plus the issue's
+    /// current values for every field on their screens (to pre-fill forms).
+    FetchTransitions { key: String },
+    /// Perform a transition; on success the issue is re-fetched.
+    DoTransition { key: String, body: Value },
+    FetchComments { key: String },
     Shutdown,
 }
 
 /// worker → UI results.
 pub enum Event {
     Board(Board),
-    IssueUpdated { key: String },
-    Error(String),
+    BoardError(String),
+    Myself { account_id: String, display_name: String },
+    Transitions {
+        key: String,
+        result: Result<(Vec<Transition>, RawFields), String>,
+    },
+    TransitionDone { key: String, result: Result<(), JiraError> },
+    IssueRefreshed(Issue),
+    Comments { key: String, result: Result<Vec<Comment>, String> },
 }
 
 pub struct Worker {
@@ -39,6 +48,11 @@ pub struct Worker {
 }
 
 impl Worker {
+    pub fn send(&self, command: Command) {
+        // A dead worker surfaces as missing responses; nothing useful to do here.
+        let _ = self.tx.send(command);
+    }
+
     /// Signal shutdown and join the worker thread.
     pub fn shutdown(&mut self) {
         let _ = self.tx.send(Command::Shutdown);
@@ -52,6 +66,7 @@ impl Worker {
 pub fn field_list(fields: &FieldMap) -> Vec<&str> {
     vec![
         "summary",
+        "issuetype",
         "status",
         "assignee",
         "priority",
@@ -61,6 +76,8 @@ pub fn field_list(fields: &FieldMap) -> Vec<&str> {
         fields.acceptance_criteria.as_str(),
         fields.sprint.as_str(),
         fields.epic_link.as_str(),
+        "epic",
+        "parent",
     ]
 }
 
@@ -82,28 +99,59 @@ fn run(
     cmd_rx: Receiver<Command>,
     evt_tx: Sender<Event>,
 ) {
+    // Needed for "assign to me" in transition forms; failure is non-fatal.
+    if let Ok(me) = client.myself() {
+        let _ = evt_tx.send(Event::Myself {
+            account_id: me.account_id,
+            display_name: me.display_name,
+        });
+    }
+
     while let Ok(cmd) = cmd_rx.recv() {
-        match cmd {
+        let event = match cmd {
+            Command::Shutdown => break,
             Command::LoadBoard { board_id } => {
-                let event = match load_board(&client, &fields, &browse_base, board_id) {
+                match load_board(&client, &fields, &browse_base, board_id) {
                     Ok(board) => Event::Board(board),
-                    Err(err) => Event::Error(format!("{err:#}")),
-                };
-                if evt_tx.send(event).is_err() {
-                    break; // UI gone
+                    Err(err) => Event::BoardError(format!("{err:#}")),
                 }
             }
-            Command::Shutdown => break,
-            // Write commands land in P3.
-            Command::RefreshIssue { .. }
-            | Command::Transition { .. }
-            | Command::UpdateField { .. }
-            | Command::AddComment { .. } => {}
+            Command::FetchTransitions { key } => {
+                let result = fetch_transitions(&client, &key).map_err(|e| format!("{e:#}"));
+                Event::Transitions { key, result }
+            }
+            Command::DoTransition { key, body } => {
+                let result = client.do_transition(&key, &body);
+                let ok = result.is_ok();
+                if evt_tx.send(Event::TransitionDone { key: key.clone(), result }).is_err() {
+                    break;
+                }
+                if !ok {
+                    continue;
+                }
+                match client.issue(&key, &field_list(&fields)) {
+                    Ok(raw) => Event::IssueRefreshed(mapping::map_issue(&raw, &fields, &browse_base)),
+                    // The move succeeded; a stale card until the next refresh is fine.
+                    Err(_) => continue,
+                }
+            }
+            Command::FetchComments { key } => {
+                let result = client
+                    .comments(&key)
+                    .map(|page| mapping::map_comments(page.comments))
+                    .map_err(|e| format!("{e:#}"));
+                Event::Comments { key, result }
+            }
+        };
+        if evt_tx.send(event).is_err() {
+            break; // UI gone
         }
     }
 }
 
-fn load_board(
+/// Load what the Jira web board shows: the active sprint(s) for scrum boards,
+/// otherwise the board's issues narrowed by its sub-filter (kanban).
+pub fn load_board(
     client: &JiraClient,
     fields: &FieldMap,
     browse_base: &str,
@@ -111,6 +159,37 @@ fn load_board(
 ) -> anyhow::Result<Board> {
     let config = client.board_configuration(board_id)?;
     let list = field_list(fields);
-    let raw = client.board_issues(board_id, &list)?;
-    Ok(mapping::build_board(config, raw, fields, browse_base))
+    let (scope, raw) = if client.board_info(board_id)?.board_type == "scrum" {
+        let sprints = client.active_sprints(board_id)?;
+        let mut raw = Vec::new();
+        for sprint in &sprints {
+            raw.extend(client.sprint_issues(board_id, sprint.id, &list)?);
+        }
+        let scope = if sprints.is_empty() {
+            "no active sprint".to_string()
+        } else {
+            sprints.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(" + ")
+        };
+        (scope, raw)
+    } else {
+        let sub_query = config.sub_query.as_ref().map(|q| q.query.trim()).filter(|q| !q.is_empty());
+        (String::new(), client.board_issues(board_id, &list, sub_query)?)
+    };
+    Ok(mapping::build_board(config, scope, raw, fields, browse_base))
+}
+
+fn fetch_transitions(client: &JiraClient, key: &str) -> anyhow::Result<(Vec<Transition>, RawFields)> {
+    let transitions = mapping::map_transitions(client.transitions(key)?.transitions);
+    let mut screen_ids: Vec<&str> = transitions
+        .iter()
+        .flat_map(|t| t.fields.iter().map(|f| f.id.as_str()))
+        .collect();
+    screen_ids.sort_unstable();
+    screen_ids.dedup();
+    let current = if screen_ids.is_empty() {
+        Value::Object(Default::default())
+    } else {
+        client.issue(key, &screen_ids)?.fields
+    };
+    Ok((transitions, current))
 }

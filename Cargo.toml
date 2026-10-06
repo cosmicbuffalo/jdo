@@ -11,10 +11,11 @@ repository = "https://github.com/cosmicbuffalo/jdo"
 ratatui = "0.29"
 crossterm = "0.28"
 tui-textarea = "0.7"
+unicode-width = "0.2"
 
 # --- serialization / config ---
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 toml = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
 chrono = { version = "0.4", features = ["serde"] }
