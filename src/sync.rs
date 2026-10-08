@@ -11,9 +11,10 @@ use std::thread::{self, JoinHandle};
 use serde_json::Value;
 
 use crate::config::FieldMap;
+use crate::create::{CreateDraft, CreateError, CreateField, CreateMeta};
 use crate::jira::client::{JiraClient, JiraError};
 use crate::jira::mapping;
-use crate::model::{Board, Comment, Issue, RawFields, Transition};
+use crate::model::{Board, Comment, Issue, RawFields, RichField, SprintRef, Transition};
 
 /// UI → worker requests.
 pub enum Command {
@@ -24,6 +25,16 @@ pub enum Command {
     /// Perform a transition; on success the issue is re-fetched.
     DoTransition { key: String, body: Value },
     FetchComments { key: String },
+    /// Description and acceptance criteria as ADF (the board API only has
+    /// plain-text renderings).
+    FetchRich { key: String },
+    /// Replace a rich-text field with an ADF document.
+    UpdateRich { key: String, field: RichField, value: Value },
+    /// Jira's create rules for a project's Story issue type.
+    FetchCreateMeta { project: String },
+    /// People who work on a team's issues (for the Assignee picker).
+    FetchTeamMembers { team_id: String },
+    CreateIssue { draft: CreateDraft },
     Shutdown,
 }
 
@@ -39,6 +50,14 @@ pub enum Event {
     TransitionDone { key: String, result: Result<(), JiraError> },
     IssueRefreshed(Issue),
     Comments { key: String, result: Result<Vec<Comment>, String> },
+    /// `(description, acceptance criteria)` as ADF.
+    Rich { key: String, result: Result<(Value, Value), String> },
+    /// On success, the document that was saved.
+    RichUpdated { key: String, field: RichField, result: Result<Value, JiraError> },
+    CreateMeta(Result<CreateMeta, String>),
+    TeamMembers(Result<Vec<(String, String)>, String>),
+    /// The new card, fetched back after creating it.
+    Created(Result<Issue, CreateError>),
 }
 
 pub struct Worker {
@@ -76,6 +95,7 @@ pub fn field_list(fields: &FieldMap) -> Vec<&str> {
         fields.acceptance_criteria.as_str(),
         fields.sprint.as_str(),
         fields.epic_link.as_str(),
+        fields.team.as_str(),
         "epic",
         "parent",
     ]
@@ -135,6 +155,45 @@ fn run(
                     Err(_) => continue,
                 }
             }
+            Command::FetchRich { key } => {
+                let ids = ["description", fields.acceptance_criteria.as_str()];
+                let result = client
+                    .issue(&key, &ids)
+                    .map(|raw| (raw.fields["description"].clone(), raw.fields[ids[1]].clone()))
+                    .map_err(|e| format!("{e:#}"));
+                Event::Rich { key, result }
+            }
+            Command::UpdateRich { key, field, value } => {
+                let id = match field {
+                    RichField::Description => "description".to_string(),
+                    RichField::AcceptanceCriteria => fields.acceptance_criteria.clone(),
+                };
+                let result = client
+                    .update_fields(&key, serde_json::json!({ id: value.clone() }))
+                    .map(|()| value);
+                Event::RichUpdated { key, field, result }
+            }
+            Command::FetchCreateMeta { project } => {
+                Event::CreateMeta(create_meta(&client, &fields, &project).map_err(|e| format!("{e:#}")))
+            }
+            Command::FetchTeamMembers { team_id } => {
+                Event::TeamMembers(client.team_members(&fields.team, &team_id).map_err(|e| format!("{e:#}")))
+            }
+            Command::CreateIssue { draft } => {
+                let result = client
+                    .create_issue(create_fields(&fields, &draft))
+                    .map_err(|e| sort_create_error(&fields, &e))
+                    .and_then(|key| {
+                        client
+                            .issue(&key, &field_list(&fields))
+                            .map(|raw| mapping::map_issue(&raw, &fields, &browse_base))
+                            .map_err(|e| CreateError {
+                                general: vec![format!("created {key}, but couldn't load it back: {e:#}")],
+                                fields: Vec::new(),
+                            })
+                    });
+                Event::Created(result)
+            }
             Command::FetchComments { key } => {
                 let result = client
                     .comments(&key)
@@ -158,24 +217,119 @@ pub fn load_board(
     board_id: u64,
 ) -> anyhow::Result<Board> {
     let config = client.board_configuration(board_id)?;
+    let info = client.board_info(board_id)?;
     let list = field_list(fields);
-    let (scope, raw) = if client.board_info(board_id)?.board_type == "scrum" {
-        let sprints = client.active_sprints(board_id)?;
+    let mut sprints = Vec::new();
+    let (scope, raw) = if info.board_type == "scrum" {
+        sprints = client
+            .open_sprints(board_id)?
+            .into_iter()
+            .map(|s| SprintRef { active: s.state == "active", id: s.id, name: s.name })
+            .collect();
+        let active: Vec<&SprintRef> = sprints.iter().filter(|s| s.active).collect();
         let mut raw = Vec::new();
-        for sprint in &sprints {
+        for sprint in &active {
             raw.extend(client.sprint_issues(board_id, sprint.id, &list)?);
         }
-        let scope = if sprints.is_empty() {
+        let scope = if active.is_empty() {
             "no active sprint".to_string()
         } else {
-            sprints.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(" + ")
+            active.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(" + ")
         };
         (scope, raw)
     } else {
         let sub_query = config.sub_query.as_ref().map(|q| q.query.trim()).filter(|q| !q.is_empty());
         (String::new(), client.board_issues(board_id, &list, sub_query)?)
     };
-    Ok(mapping::build_board(config, scope, raw, fields, browse_base))
+    let project = info.location.project_key;
+    Ok(mapping::build_board(config, scope, project, sprints, raw, fields, browse_base))
+}
+
+/// The dialog field a Jira field id belongs to.
+fn create_field_for(fields: &FieldMap, id: &str) -> Option<CreateField> {
+    match id {
+        "summary" => Some(CreateField::Title),
+        "description" => Some(CreateField::Description),
+        "parent" | "parentId" => Some(CreateField::Epic),
+        "assignee" => Some(CreateField::Assignee),
+        id if id == fields.acceptance_criteria => Some(CreateField::Acceptance),
+        id if id == fields.team => Some(CreateField::Team),
+        id if id == fields.sprint => Some(CreateField::Sprint),
+        id if id == fields.epic_link => Some(CreateField::Epic),
+        _ => None,
+    }
+}
+
+/// New cards are Stories; read which fields Jira requires for them.
+fn create_meta(client: &JiraClient, fields: &FieldMap, project: &str) -> anyhow::Result<CreateMeta> {
+    let types = client.create_issue_types(project)?;
+    let (issue_type_id, issue_type_name) = types
+        .iter()
+        .find(|(_, name)| name.eq_ignore_ascii_case("story"))
+        .or_else(|| types.iter().find(|(_, name)| !matches!(name.as_str(), "Epic" | "Sub-task")))
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("{project} has no issue type jdo can create"))?;
+    let mut meta = CreateMeta { issue_type_id: issue_type_id.clone(), issue_type_name, ..Default::default() };
+    for field in client.create_fields(project, &issue_type_id)? {
+        let required = field["required"].as_bool().unwrap_or(false);
+        let defaulted = field["hasDefaultValue"].as_bool().unwrap_or(false);
+        let id = field["fieldId"].as_str().or_else(|| field["key"].as_str()).unwrap_or("");
+        if !required || matches!(id, "project" | "issuetype" | "reporter") {
+            continue;
+        }
+        match create_field_for(fields, id) {
+            Some(f) => meta.required.push(f),
+            None if !defaulted => meta.missing.push(field["name"].as_str().unwrap_or(id).to_string()),
+            None => {}
+        }
+    }
+    Ok(meta)
+}
+
+/// The create request's `fields`, using the instance's field ids.
+fn create_fields(fields: &FieldMap, draft: &CreateDraft) -> Value {
+    let mut out = serde_json::Map::new();
+    out.insert("project".into(), serde_json::json!({ "key": draft.project_key }));
+    out.insert("issuetype".into(), serde_json::json!({ "id": draft.issue_type_id }));
+    out.insert("summary".into(), Value::String(draft.summary.clone()));
+    if let Some(doc) = &draft.description {
+        out.insert("description".into(), doc.clone());
+    }
+    if let Some(doc) = &draft.acceptance {
+        out.insert(fields.acceptance_criteria.clone(), doc.clone());
+    }
+    if let Some(team) = &draft.team {
+        out.insert(fields.team.clone(), Value::String(team.clone()));
+    }
+    if let Some(sprint) = draft.sprint {
+        out.insert(fields.sprint.clone(), serde_json::json!(sprint));
+    }
+    if let Some(epic) = &draft.epic {
+        out.insert("parent".into(), serde_json::json!({ "key": epic }));
+    }
+    if let Some(account) = &draft.assignee {
+        out.insert("assignee".into(), serde_json::json!({ "accountId": account }));
+    }
+    Value::Object(out)
+}
+
+/// Put each of Jira's errors on its dialog field; the rest are general.
+fn sort_create_error(fields: &FieldMap, error: &JiraError) -> CreateError {
+    let mut sorted = CreateError::default();
+    for (id, message) in &error.field_errors {
+        match create_field_for(fields, id) {
+            Some(field) if !sorted.fields.iter().any(|(f, _)| *f == field) => sorted.fields.push((field, message.clone())),
+            Some(_) => {}
+            None => sorted.general.push(format!("{id}: {message}")),
+        }
+    }
+    // Jira repeats field errors in `errorMessages` ("Summary: Summary is required.").
+    for message in &error.messages {
+        if !sorted.fields.iter().any(|(_, m)| message.ends_with(m.as_str())) {
+            sorted.general.push(message.clone());
+        }
+    }
+    sorted
 }
 
 fn fetch_transitions(client: &JiraClient, key: &str) -> anyhow::Result<(Vec<Transition>, RawFields)> {

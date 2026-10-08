@@ -13,6 +13,8 @@ pub struct BoardInfo {
     /// `scrum` or `kanban` (or `simple` for team-managed boards).
     #[serde(rename = "type", default)]
     pub board_type: String,
+    #[serde(default)]
+    pub location: BoardLocation,
 }
 
 /// `GET /rest/agile/1.0/board/{id}/configuration`
@@ -43,6 +45,16 @@ pub struct SprintPage {
 pub struct Sprint {
     pub id: u64,
     pub name: String,
+    #[serde(default)]
+    pub state: String,
+}
+
+/// `GET /rest/agile/1.0/board/{id}` → `location`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BoardLocation {
+    #[serde(default)]
+    pub project_key: String,
 }
 
 #[derive(Debug, Deserialize)]

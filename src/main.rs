@@ -11,6 +11,7 @@ mod app;
 mod clipboard;
 mod colors;
 mod config;
+mod create;
 mod form;
 mod jira;
 mod lanes;
@@ -95,7 +96,7 @@ fn main() -> Result<()> {
 
     let mouse = !cli.no_mouse;
     let mut terminal = setup_terminal(mouse)?;
-    let result = run_event_loop(&mut terminal, &mut app, &worker, cfg.board_id, watch.as_mut());
+    let result = run_event_loop(&mut terminal, &mut app, &worker, cfg.board_id, watch.as_mut(), mouse);
     restore_terminal(&mut terminal, mouse)?;
 
     let mut worker = worker;
@@ -117,6 +118,7 @@ fn run_event_loop(
     worker: &Worker,
     board_id: u64,
     mut watch: Option<&mut reload::BinaryWatch>,
+    mouse: bool,
 ) -> Result<Exit> {
     loop {
         if app.can_restart() && watch.as_mut().is_some_and(|w| w.replaced()) {
@@ -135,6 +137,11 @@ fn run_event_loop(
                 SyncEvent::TransitionDone { key, result } => app.on_transition_done(&key, result),
                 SyncEvent::IssueRefreshed(issue) => app.on_issue_refreshed(issue),
                 SyncEvent::Comments { key, result } => app.on_comments(&key, result),
+                SyncEvent::Rich { key, result } => app.on_rich(&key, result),
+                SyncEvent::RichUpdated { key, field, result } => app.on_rich_updated(&key, field, result),
+                SyncEvent::CreateMeta(result) => app.on_create_meta(result),
+                SyncEvent::TeamMembers(result) => app.on_team_members(result),
+                SyncEvent::Created(result) => app.on_created(result),
             }
         }
 
@@ -148,16 +155,53 @@ fn run_event_loop(
                 TermEvent::Mouse(mouse) => app.handle_mouse(mouse),
                 _ => continue,
             };
-            match action {
-                Action::None => {}
-                Action::Quit => return Ok(Exit::Quit),
-                Action::Refresh => worker.send(Command::LoadBoard { board_id }),
-                Action::FetchTransitions(key) => worker.send(Command::FetchTransitions { key }),
-                Action::SubmitTransition { key, body } => worker.send(Command::DoTransition { key, body }),
-                Action::FetchComments(key) => worker.send(Command::FetchComments { key }),
+            if dispatch(action, app, worker, board_id, terminal, mouse) {
+                return Ok(Exit::Quit);
             }
         }
     }
+}
+
+/// Carry out an [`Action`]; returns true to quit.
+fn dispatch(
+    action: Action,
+    app: &mut App,
+    worker: &Worker,
+    board_id: u64,
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    mouse: bool,
+) -> bool {
+    match action {
+        Action::None => {}
+        Action::Many(actions) => {
+            for action in actions {
+                if dispatch(action, app, worker, board_id, terminal, mouse) {
+                    return true;
+                }
+            }
+        }
+        Action::Quit => return true,
+        Action::Refresh => worker.send(Command::LoadBoard { board_id }),
+        Action::FetchTransitions(key) => worker.send(Command::FetchTransitions { key }),
+        Action::SubmitTransition { key, body } => worker.send(Command::DoTransition { key, body }),
+        Action::FetchDetails(key) => {
+            worker.send(Command::FetchComments { key: key.clone() });
+            worker.send(Command::FetchRich { key });
+        }
+        Action::SaveRich { key, field, value } => worker.send(Command::UpdateRich { key, field, value }),
+        Action::FetchCreateMeta(project) => worker.send(Command::FetchCreateMeta { project }),
+        Action::FetchTeamMembers(team_id) => worker.send(Command::FetchTeamMembers { team_id }),
+        Action::CreateIssue(draft) => worker.send(Command::CreateIssue { draft }),
+        Action::EditExternally => {
+            if let Some(text) = app.rich_editor_text() {
+                match edit_externally(terminal, mouse, &text) {
+                    Ok(edited) => app.set_rich_editor_text(&edited),
+                    Err(error) => app.error(format!("$EDITOR failed: {error:#}")),
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Headless fetch + print, for testing auth and mapping without the TUI.
@@ -191,6 +235,38 @@ fn setup_terminal(mouse: bool) -> Result<Terminal<CrosstermBackend<Stdout>>> {
         execute!(stdout, EnableMouseCapture)?;
     }
     Ok(Terminal::new(CrosstermBackend::new(stdout))?)
+}
+
+/// Suspend the TUI, edit `text` in `$VISUAL`/`$EDITOR` (default `vi`) as a
+/// Markdown file, then resume. Returns the edited text.
+fn edit_externally(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mouse: bool, text: &str) -> Result<String> {
+    let path = std::env::temp_dir().join(format!("jdo-{}.md", std::process::id()));
+    std::fs::write(&path, text).context("write temp file")?;
+    let editor = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| "vi".into());
+    let argv = shlex::split(&editor).filter(|a| !a.is_empty()).unwrap_or_else(|| vec![editor.clone()]);
+
+    disable_raw_mode()?;
+    if mouse {
+        execute!(terminal.backend_mut(), DisableMouseCapture)?;
+    }
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    let status = std::process::Command::new(&argv[0]).args(&argv[1..]).arg(&path).status();
+    enable_raw_mode()?;
+    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+    if mouse {
+        execute!(terminal.backend_mut(), EnableMouseCapture)?;
+    }
+    terminal.clear()?;
+
+    let edited = std::fs::read_to_string(&path);
+    let _ = std::fs::remove_file(&path);
+    match status {
+        Ok(status) if status.success() => Ok(edited.context("read temp file")?.trim_end_matches('\n').to_string()),
+        Ok(status) => anyhow::bail!("{} exited with {status}", argv[0]),
+        Err(error) => anyhow::bail!("couldn't run {}: {error}", argv[0]),
+    }
 }
 
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mouse: bool) -> Result<()> {

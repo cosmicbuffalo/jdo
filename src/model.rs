@@ -12,9 +12,27 @@ pub struct Board {
     pub name: String,
     /// What slice of the board is shown, e.g. the active sprint's name.
     pub scope: String,
+    /// The board's project (new cards are created here).
+    pub project_key: String,
+    /// Active, then future sprints — the choices when creating a card.
+    pub sprints: Vec<SprintRef>,
     pub columns: Vec<Column>,
     /// How column WIP limits count issues.
     pub constraint: Constraint,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SprintRef {
+    pub id: u64,
+    pub name: String,
+    pub active: bool,
+}
+
+/// An Atlassian team (the Team field).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TeamRef {
+    pub id: String,
+    pub name: String,
 }
 
 /// Board-level WIP-limit mode (from the board's column configuration).
@@ -76,16 +94,35 @@ pub struct Issue {
     pub status: String,
     pub status_id: String,
     pub assignee: Option<String>,
+    /// The assignee's account id (for assigning new cards).
+    pub assignee_id: Option<String>,
     pub priority: Option<String>,
     pub labels: Vec<String>,
     pub description: String,
     pub acceptance_criteria: String,
     pub story_points: Option<f64>,
     pub sprint: Option<String>,
+    pub team: Option<TeamRef>,
     pub epic: Option<EpicRef>,
     /// Browser URL for the issue (used by copy-to-clipboard).
     pub url: String,
     pub sync_state: SyncState,
+}
+
+/// A rich-text field that can be edited from the details view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RichField {
+    Description,
+    AcceptanceCriteria,
+}
+
+impl RichField {
+    pub fn label(self) -> &'static str {
+        match self {
+            RichField::Description => "Description",
+            RichField::AcceptanceCriteria => "Acceptance Criteria",
+        }
+    }
 }
 
 /// The epic an issue belongs to.

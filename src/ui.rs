@@ -12,11 +12,13 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::app::{App, CommentsState, Hit, HitTarget, LaneFocus, Mode, StatusLevel};
+use crate::app::{App, CommentsState, CreateHit, Hit, HitTarget, LaneFocus, Mode, RichEditor, RichState, StatusLevel};
+use crate::create::{CreateField, CreateFocus, CreateForm, PickOption};
+use crate::jira::adf;
 use crate::colors::{self, UserColors};
 use crate::form::{FieldKind, TransitionForm};
 use crate::lanes::{Grouping, Lane, LaneKind};
-use crate::model::{EpicRef, Issue, Load, SyncState};
+use crate::model::{EpicRef, Issue, Load, RichField, SyncState};
 
 /// tdo's signature accent (TUI_ACCENT) and background.
 const ACCENT: Color = Color::Rgb(255, 135, 0);
@@ -64,6 +66,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     if let Mode::TransitionForm(form, _) = &mut app.mode {
         draw_form(frame, form);
+    }
+    if let Mode::EditRich(editor) = &mut app.mode {
+        draw_rich_editor(frame, editor);
+    }
+    if let Mode::Create(form) = &mut app.mode {
+        let mut hits = Vec::new();
+        draw_create(frame, form, &app.user_colors, &mut hits);
+        app.hits.extend(hits);
     }
 }
 
@@ -681,7 +691,31 @@ fn footer_hints(app: &App) -> (&'static str, Vec<Hint>) {
         Mode::Help { .. } => ("HELP", vec![hint("esc close", Esc)]),
         Mode::Details { .. } => (
             "DETAILS",
-            vec![nav("j/k scroll"), hint("m move", Char('m')), hint("esc close", Esc), hint("? keymap", Char('?'))],
+            vec![
+                nav("j/k scroll"),
+                hint("e edit description", Char('e')),
+                hint("a edit acceptance criteria", Char('a')),
+                hint("m move", Char('m')),
+                hint("esc close", Esc),
+                hint("? keymap", Char('?')),
+            ],
+        ),
+        Mode::Create(_) => (
+            "CREATE",
+            vec![
+                hint("tab next field", Tab),
+                hint_with("^s submit", Char('s'), KeyModifiers::CONTROL),
+                hint_with("^g $EDITOR", Char('g'), KeyModifiers::CONTROL),
+                hint("esc cancel", Esc),
+            ],
+        ),
+        Mode::EditRich(_) => (
+            "EDIT",
+            vec![
+                hint_with("^s save", Char('s'), KeyModifiers::CONTROL),
+                hint_with("^g $EDITOR", Char('g'), KeyModifiers::CONTROL),
+                hint("esc cancel", Esc),
+            ],
         ),
         Mode::Moving(_) => (
             "MOVE",
@@ -774,6 +808,7 @@ fn draw_help(frame: &mut Frame) {
         key("1-9", "jump to a column"),
         key("Enter", "open card details"),
         key("m", "enter MOVE mode for the card"),
+        key("c", "create a new card"),
         key("g", "group: none → epic → assignee"),
         key("h at column 1", "gutter: j/k hop lane headers"),
         key("z / Enter", "fold / unfold a lane"),
@@ -784,6 +819,7 @@ fn draw_help(frame: &mut Frame) {
         key("j / k", "scroll"),
         key("^d / ^u", "scroll half a page"),
         key("g / G", "top / bottom"),
+        key("e / a", "edit description / acceptance"),
         key("m", "move this card"),
         key("Esc / q", "close details"),
     ];
@@ -800,6 +836,10 @@ fn draw_help(frame: &mut Frame) {
         key("Enter / e", "edit field / open options"),
         key("Ctrl-S", "submit the move"),
         key("Esc", "cancel the move"),
+        Line::raw(""),
+        heading("EDITING DESCRIPTION / AC"),
+        key("Ctrl-S", "save to Jira (Markdown)"),
+        key("Ctrl-G", "edit in $EDITOR"),
         Line::raw(""),
         heading("EDITING A FIELD"),
         key("Enter", "save the field"),
@@ -830,7 +870,7 @@ fn draw_details(frame: &mut Frame, app: &mut App) {
     let width = area.width.saturating_sub(4).max(10) as usize;
 
     let lines = match app.board.issue(key) {
-        Some(issue) => detail_lines(issue, app.comments.get(key), width, &app.user_colors),
+        Some(issue) => detail_lines(issue, app.comments.get(key), app.rich.get(key), width, &app.user_colors),
         None => vec![Line::styled(format!("{key} is no longer on this board."), Style::default().fg(MUTED))],
     };
     let title = format!(" {key} · details ");
@@ -876,6 +916,7 @@ fn draw_details(frame: &mut Frame, app: &mut App) {
 fn detail_lines(
     issue: &Issue,
     comments: Option<&CommentsState>,
+    rich: Option<&RichState>,
     width: usize,
     people: &UserColors,
 ) -> Vec<Line<'static>> {
@@ -928,10 +969,21 @@ fn detail_lines(
         }
     }
 
-    for (title, body) in [("Description", &issue.description), ("Acceptance Criteria", &issue.acceptance_criteria)] {
+    // Prefer the rich document (fetched on open) over the board API's plain text.
+    for (field, fallback, key) in [
+        (RichField::Description, &issue.description, "e"),
+        (RichField::AcceptanceCriteria, &issue.acceptance_criteria, "a"),
+    ] {
+        let body = match rich.and_then(|r| r.get(field)) {
+            Some(value) => adf::to_text(Some(value)),
+            None => fallback.clone(),
+        };
         lines.push(Line::raw(""));
-        lines.push(heading(title.to_string()));
-        push_body(&mut lines, body, width, 0);
+        lines.push(Line::from(vec![
+            Span::styled(field.label().to_string(), Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("  {key} to edit"), Style::default().fg(MUTED)),
+        ]));
+        push_body(&mut lines, &body, width, 0);
     }
 
     lines.push(Line::raw(""));
@@ -1187,6 +1239,313 @@ fn draw_picker(frame: &mut Frame, form: &TransitionForm) {
         Paragraph::new(hint_text).alignment(Alignment::Center).style(Style::default().fg(MUTED)),
         hint,
     );
+}
+
+/// The Markdown editor for a description or acceptance criteria.
+fn draw_rich_editor(frame: &mut Frame, editor: &mut RichEditor) {
+    let screen = frame.area();
+    let area = centered(screen, 90, screen.height.saturating_mul(85) / 100);
+    let title = format!(" {} · edit {} · Markdown ", editor.key, editor.field.label());
+
+    // Notes under the text: placeholders, what saving loses, status.
+    let mut notes: Vec<Line<'static>> = Vec::new();
+    let kinds = editor.markdown.placeholder_kinds();
+    if !kinds.is_empty() {
+        notes.push(Line::styled(
+            format!("⟦n:…⟧ placeholders keep this field's {} intact — leave them in place to keep them", kinds.join(", ")),
+            Style::default().fg(MUTED),
+        ));
+    }
+    if !editor.markdown.dropped.is_empty() {
+        notes.push(Line::styled(
+            format!("Saving will drop formatting Markdown can't express: {}", editor.markdown.dropped.join(", ")),
+            Style::default().fg(CHANGE),
+        ));
+    }
+    if let Some(error) = &editor.error {
+        notes.push(Line::styled(format!("⚠ {error}"), Style::default().fg(DANGER)));
+    }
+    if editor.saving {
+        notes.push(Line::styled("saving to Jira…", Style::default().fg(CHANGE)));
+    }
+
+    frame.render_widget(Clear, area);
+    let block = modal_block(&title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let [text_area, notes_area, hint] = Layout::vertical([
+        Constraint::Min(3),
+        Constraint::Length(notes.len() as u16),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+
+    let text = &mut editor.editor;
+    text.set_cursor_line_style(Style::default());
+    text.set_style(Style::default().fg(TEXT).bg(BACKGROUND));
+    text.set_cursor_style(Style::default().fg(BACKGROUND).bg(ACCENT));
+    frame.render_widget(&*text, text_area.inner(Margin::new(1, 0)));
+    frame.render_widget(Paragraph::new(notes).wrap(ratatui::widgets::Wrap { trim: false }), notes_area.inner(Margin::new(1, 0)));
+    frame.render_widget(
+        Paragraph::new("Ctrl-S save · Ctrl-G $EDITOR · Esc cancel")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(MUTED)),
+        hint,
+    );
+}
+
+// ----- create dialog ---------------------------------------------------------
+
+/// Width of the label column in the create dialog.
+const CREATE_LABEL: u16 = 23;
+
+/// The "Create new <PROJECT> ticket" dialog. Records click targets in `hits`.
+fn draw_create(frame: &mut Frame, form: &mut CreateForm, people: &UserColors, hits: &mut Vec<Hit>) {
+    let screen = frame.area();
+    let width = (screen.width * 8 / 10).clamp(60.min(screen.width), 130.min(screen.width));
+    let area = centered_fixed(screen, width, screen.height.saturating_mul(9) / 10);
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT))
+        .style(Style::default().fg(TEXT).bg(BACKGROUND));
+    let inner = block.inner(area).inner(Margin::new(1, 0));
+    frame.render_widget(block, area);
+
+    let err_rows = |field| u16::from(form.field_errors.contains_key(&field));
+    let rows = Layout::vertical([
+        Constraint::Length(1),                                           // header
+        Constraint::Length(1),                                           // rules status
+        Constraint::Length(form.errors.len() as u16),                    // general errors
+        Constraint::Length(1),                                           // gap
+        Constraint::Length(1 + err_rows(CreateField::Team)),
+        Constraint::Length(1 + err_rows(CreateField::Sprint)),
+        Constraint::Length(1 + err_rows(CreateField::Epic)),
+        Constraint::Length(1 + err_rows(CreateField::Assignee)),
+        Constraint::Length(1),                                           // gap
+        Constraint::Length(3 + err_rows(CreateField::Title)),
+        Constraint::Min(4 + err_rows(CreateField::Description)),
+        Constraint::Min(4 + err_rows(CreateField::Acceptance)),
+        Constraint::Length(1),                                           // gap
+        Constraint::Length(1),                                           // buttons
+    ])
+    .split(inner);
+
+    // Header: title + [×].
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            format!("Create new {} ticket:", form.project_key),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )),
+        rows[0],
+    );
+    let close = Rect::new(area.x + area.width - 5, area.y, 3, 1);
+    frame.render_widget(Paragraph::new(Span::styled("[×]", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))), close);
+    hits.push(Hit { area: close, target: HitTarget::Create(CreateHit::Cancel) });
+
+    let status = match (&form.meta, &form.meta_error) {
+        (Some(meta), _) => Line::styled(format!("{} · fields marked * are required", meta.issue_type_name), Style::default().fg(MUTED)),
+        (None, Some(error)) => Line::styled(format!("⚠ couldn't load Jira's create rules: {error}"), Style::default().fg(DANGER)),
+        (None, None) => Line::styled("Story · loading Jira's create rules…", Style::default().fg(MUTED)),
+    };
+    frame.render_widget(Paragraph::new(status), rows[1]);
+    let general: Vec<Line> = form.errors.iter().map(|e| Line::styled(format!("⚠ {e}"), Style::default().fg(DANGER))).collect();
+    frame.render_widget(Paragraph::new(general), rows[2]);
+
+    // Label on the left, control on the right, error underneath.
+    let split = |row: Rect, field: CreateField, frame: &mut Frame, hits: &mut Vec<Hit>| -> Rect {
+        let focused = form.focus == CreateFocus::Field(field);
+        let mut label = vec![Span::styled(
+            field.label(),
+            if focused {
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(SUBTLE)
+            },
+        )];
+        if form.required(field) {
+            label.push(Span::styled(" *", Style::default().fg(DANGER)));
+        }
+        let error = form.field_errors.get(&field);
+        let control_height = row.height.saturating_sub(u16::from(error.is_some()));
+        let label_y = if control_height >= 3 { row.y + 1 } else { row.y };
+        frame.render_widget(Paragraph::new(Line::from(label)), Rect::new(row.x, label_y, CREATE_LABEL, 1));
+        let control = Rect::new(row.x + CREATE_LABEL, row.y, row.width.saturating_sub(CREATE_LABEL), control_height);
+        if let Some(error) = error {
+            frame.render_widget(
+                Paragraph::new(Span::styled(format!("⚠ {error}"), Style::default().fg(DANGER))),
+                Rect::new(control.x, row.y + control_height, control.width, 1),
+            );
+        }
+        hits.push(Hit { area: Rect::new(row.x, row.y, row.width, control_height), target: HitTarget::Create(CreateHit::Focus(field)) });
+        control
+    };
+
+    // Pickers: one line each; the focused one shows its filter and opens a dropdown.
+    let mut open_dropdown: Option<(CreateField, Rect)> = None;
+    for (row, field) in [
+        (rows[4], CreateField::Team),
+        (rows[5], CreateField::Sprint),
+        (rows[6], CreateField::Epic),
+        (rows[7], CreateField::Assignee),
+    ] {
+        let control = split(row, field, frame, hits);
+        let picker = form.picker(field).expect("picker field");
+        let focused = form.focus == CreateFocus::Field(field);
+        let mut spans = Vec::new();
+        if focused {
+            spans.push(Span::styled(picker.filter.clone(), Style::default().fg(TEXT)));
+            spans.push(Span::styled(" ", Style::default().bg(ACCENT)));
+            if picker.filter.is_empty() {
+                spans.push(Span::styled("  type to filter · ", Style::default().fg(MUTED)));
+                spans.extend(pick_spans(field, &picker.chosen, people));
+            }
+            open_dropdown = Some((field, Rect::new(control.x, row.y + row.height, control.width, 0)));
+        } else {
+            spans.extend(pick_spans(field, &picker.chosen, people));
+            spans.push(Span::styled("  ▾", Style::default().fg(MUTED)));
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), control);
+    }
+
+    // Title / Description / Acceptance Criteria: boxed editors. Lay the rows
+    // out first; the editors are borrowed mutably to draw them.
+    let text_rows: Vec<(Rect, CreateField)> = [(rows[9], CreateField::Title), (rows[10], CreateField::Description), (rows[11], CreateField::Acceptance)]
+        .into_iter()
+        .map(|(row, field)| (split(row, field, frame, hits), field))
+        .collect();
+    for (control, field) in text_rows {
+        let focused = form.focus == CreateFocus::Field(field);
+        let area_widget = match field {
+            CreateField::Title => &mut form.title,
+            CreateField::Description => &mut form.description,
+            _ => &mut form.acceptance,
+        };
+        let hint = match field {
+            CreateField::Title => "",
+            _ if focused => " Markdown · ^G $EDITOR ",
+            _ => " Markdown ",
+        };
+        area_widget.set_block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(if focused { ACCENT } else { BORDER }))
+                .title_bottom(Line::styled(hint, Style::default().fg(MUTED)).right_aligned()),
+        );
+        area_widget.set_style(Style::default().fg(TEXT).bg(BACKGROUND));
+        area_widget.set_cursor_line_style(Style::default());
+        area_widget.set_cursor_style(if focused { Style::default().fg(BACKGROUND).bg(ACCENT) } else { Style::default() });
+        frame.render_widget(&*area_widget, control);
+    }
+
+    // Footer: centered Cancel, then Submit on the right.
+    let footer = rows[13];
+    if form.submitting {
+        frame.render_widget(
+            Paragraph::new(Span::styled("creating in Jira…", Style::default().fg(CHANGE))).alignment(Alignment::Center),
+            footer,
+        );
+    } else {
+        let cancel = button("Cancel", ButtonKind::Secondary, form.focus == CreateFocus::Cancel);
+        let submit = button("Submit", ButtonKind::Primary, form.focus == CreateFocus::Submit);
+        let (cancel_w, submit_w, gap) = (cancel.content.width() as u16, submit.content.width() as u16, 3);
+        let total = cancel_w + gap + submit_w;
+        let x = footer.x + footer.width.saturating_sub(total) / 2;
+        let line = Line::from(vec![cancel, Span::raw(" ".repeat(gap as usize)), submit]);
+        frame.render_widget(Paragraph::new(line), Rect::new(x, footer.y, total.min(footer.width), 1));
+        hits.push(Hit { area: Rect::new(x, footer.y, cancel_w, 1), target: HitTarget::Create(CreateHit::Cancel) });
+        hits.push(Hit {
+            area: Rect::new(x + cancel_w + gap, footer.y, submit_w, 1),
+            target: HitTarget::Create(CreateHit::Submit),
+        });
+    }
+
+    // The focused picker's dropdown, drawn last so it overlays what's below.
+    if let Some((field, anchor)) = open_dropdown {
+        let picker = form.picker(field).expect("picker field");
+        let options = picker.matches();
+        let extra = u16::from(picker.loading);
+        let visible = options.len().clamp(1, 8) as u16;
+        let drop = Rect::new(anchor.x, anchor.y, anchor.width, visible + extra + 2).intersection(screen);
+        frame.render_widget(Clear, drop);
+        let start = (picker.highlight + 1).saturating_sub(visible as usize);
+        let mut lines: Vec<Line> = options
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(visible as usize)
+            .map(|(i, option)| {
+                let mut spans = vec![Span::styled(if i == picker.highlight { "▊ " } else { "  " }, Style::default().fg(ACCENT))];
+                spans.extend(pick_spans(field, option, people));
+                Line::from(spans)
+            })
+            .collect();
+        if lines.is_empty() {
+            lines.push(Line::styled("  no matches", Style::default().fg(MUTED)));
+        }
+        if picker.loading {
+            lines.push(Line::styled("  loading the team's members…", Style::default().fg(MUTED)));
+        }
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(ACCENT)))
+                .style(Style::default().bg(BACKGROUND)),
+            drop,
+        );
+        for (row, i) in (start..options.len()).take(visible as usize).enumerate() {
+            hits.push(Hit {
+                area: Rect::new(drop.x + 1, drop.y + 1 + row as u16, drop.width.saturating_sub(2), 1),
+                target: HitTarget::Create(CreateHit::Pick(field, i)),
+            });
+        }
+    }
+}
+
+/// How a picker choice reads: epics in their color, people as pills.
+fn pick_spans(field: CreateField, option: &PickOption, people: &UserColors) -> Vec<Span<'static>> {
+    let mut spans = match (field, &option.key) {
+        (CreateField::Epic, key) => epic_line(key, &option.label, option.color).spans,
+        (CreateField::Assignee, Some(_)) => user_pill(&option.label, people.color(&option.label)),
+        (CreateField::Assignee, None) => vec![Span::styled(option.label.clone(), Style::default().fg(MUTED))],
+        (_, Some(_)) => vec![Span::styled(option.label.clone(), Style::default().fg(TEXT))],
+        (_, None) => vec![Span::styled(option.label.clone(), Style::default().fg(MUTED))],
+    };
+    if let Some(note) = &option.note {
+        spans.push(Span::styled(format!("  {note}"), Style::default().fg(MUTED)));
+    }
+    spans
+}
+
+#[derive(Clone, Copy)]
+enum ButtonKind {
+    /// The main action (Submit): accent fill.
+    Primary,
+    /// Everything else (Cancel): gray fill.
+    Secondary,
+}
+
+/// A filled, square-edged button; brighter and bold when focused.
+fn button(label: &str, kind: ButtonKind, focused: bool) -> Span<'static> {
+    let (bg, fg) = match (kind, focused) {
+        (ButtonKind::Primary, true) => (ACCENT, BACKGROUND),
+        (ButtonKind::Primary, false) => (Color::Rgb(150, 82, 10), Color::Rgb(255, 230, 200)),
+        (ButtonKind::Secondary, true) => (Color::Rgb(150, 150, 150), BACKGROUND),
+        (ButtonKind::Secondary, false) => (Color::Rgb(70, 70, 70), TEXT),
+    };
+    let modifier = if focused { Modifier::BOLD } else { Modifier::empty() };
+    Span::styled(format!("   {label}   "), Style::default().fg(fg).bg(bg).add_modifier(modifier))
+}
+
+/// `KEY: name` in the epic's color, or a muted "No epic".
+fn epic_line(key: &Option<String>, name: &str, color: Option<usize>) -> Line<'static> {
+    match key {
+        Some(key) => {
+            let epic = EpicRef { key: key.clone(), name: name.to_string(), color };
+            let text = if name.is_empty() { key.clone() } else { format!("{key}: {name}") };
+            Line::from(Span::styled(text, Style::default().fg(epic_color(&epic)).add_modifier(Modifier::BOLD)))
+        }
+        None => Line::styled(name.to_string(), Style::default().fg(MUTED)),
+    }
 }
 
 // ----- helpers -------------------------------------------------------------

@@ -13,10 +13,14 @@ use ratatui::layout::Rect;
 use serde_json::Value;
 
 use crate::colors::UserColors;
+use crate::create::{CreateDraft, CreateError, CreateField, CreateForm, CreateMeta, CreateOutcome};
 use crate::form::{FormOutcome, TransitionForm, needs_form};
+use crate::jira::adf;
+use crate::jira::markdown::{self, Markdown};
 use crate::jira::client::JiraError;
 use crate::lanes::{self, Grouping, Lane};
-use crate::model::{Board, Column, Comment, Issue, RawFields, SyncState, Transition};
+use crate::model::{Board, Column, Comment, Issue, RawFields, RichField, SyncState, Transition};
+use tui_textarea::TextArea;
 
 /// What the event loop should do after a key press.
 pub enum Action {
@@ -25,7 +29,16 @@ pub enum Action {
     Refresh,
     FetchTransitions(String),
     SubmitTransition { key: String, body: Value },
-    FetchComments(String),
+    /// Load what the details view needs: comments and the rich-text fields.
+    FetchDetails(String),
+    SaveRich { key: String, field: RichField, value: Value },
+    /// Hand the open field editor's text to `$EDITOR`.
+    EditExternally,
+    /// Several of the above, in order.
+    Many(Vec<Action>),
+    FetchCreateMeta(String),
+    FetchTeamMembers(String),
+    CreateIssue(CreateDraft),
 }
 
 pub enum Mode {
@@ -34,6 +47,40 @@ pub enum Mode {
     Details { key: String, scroll: u16 },
     Moving(MoveState),
     TransitionForm(Box<TransitionForm>, PendingMove),
+    EditRich(Box<RichEditor>),
+    Create(Box<CreateForm>),
+}
+
+/// Editing a description or acceptance criteria as Markdown.
+pub struct RichEditor {
+    pub key: String,
+    pub field: RichField,
+    pub editor: TextArea<'static>,
+    /// The Markdown as opened, to skip saving when nothing changed.
+    pub original: String,
+    /// Placeholder originals and what saving would drop.
+    pub markdown: Markdown,
+    pub saving: bool,
+    pub error: Option<String>,
+    /// Details scroll to return to.
+    pub details_scroll: u16,
+}
+
+/// A card's rich-text fields as ADF, fetched when its details open.
+pub enum RichState {
+    Loading,
+    Loaded { description: Value, acceptance: Value },
+    Failed(String),
+}
+
+impl RichState {
+    pub fn get(&self, field: RichField) -> Option<&Value> {
+        match (self, field) {
+            (RichState::Loaded { description, .. }, RichField::Description) => Some(description),
+            (RichState::Loaded { acceptance, .. }, RichField::AcceptanceCriteria) => Some(acceptance),
+            _ => None,
+        }
+    }
 }
 
 /// Where a card came from, so a cancelled or rejected move can put it back.
@@ -73,6 +120,17 @@ pub enum HitTarget {
     CloseDetails,
     /// A footer hint: clicking presses its key.
     Key(KeyEvent),
+    /// Something in the create dialog.
+    Create(CreateHit),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreateHit {
+    Focus(CreateField),
+    /// Row `n` of a picker's open dropdown.
+    Pick(CreateField, usize),
+    Submit,
+    Cancel,
 }
 
 #[derive(Debug, Clone)]
@@ -154,6 +212,7 @@ pub struct App {
     pub mode: Mode,
     pub status: Option<(String, StatusLevel)>,
     pub comments: HashMap<String, CommentsState>,
+    pub rich: HashMap<String, RichState>,
     /// `(accountId, displayName)` of the signed-in user.
     pub me: Option<(String, String)>,
     /// Moves submitted without a form, awaiting Jira's verdict.
@@ -188,6 +247,7 @@ impl App {
             mode: Mode::Board,
             status: None,
             comments: HashMap::new(),
+            rich: HashMap::new(),
             me: None,
             in_flight: HashMap::new(),
             deferred_board: None,
@@ -695,6 +755,68 @@ impl App {
         self.comments.insert(key.to_string(), state);
     }
 
+    pub fn on_rich(&mut self, key: &str, result: Result<(Value, Value), String>) {
+        let state = match result {
+            Ok((description, acceptance)) => RichState::Loaded { description, acceptance },
+            Err(message) => RichState::Failed(message),
+        };
+        self.rich.insert(key.to_string(), state);
+    }
+
+    pub fn on_rich_updated(&mut self, key: &str, field: RichField, result: Result<Value, JiraError>) {
+        let Mode::EditRich(editor) = &mut self.mode else { return };
+        if editor.key != key || editor.field != field {
+            return;
+        }
+        match result {
+            Ok(value) => {
+                let text = adf::to_text(Some(&value));
+                if let Some(issue) = self.board.issue_mut(key) {
+                    match field {
+                        RichField::Description => issue.description = text,
+                        RichField::AcceptanceCriteria => issue.acceptance_criteria = text,
+                    }
+                }
+                if let Some(RichState::Loaded { description, acceptance }) = self.rich.get_mut(key) {
+                    match field {
+                        RichField::Description => *description = value,
+                        RichField::AcceptanceCriteria => *acceptance = value,
+                    }
+                }
+                let scroll = editor.details_scroll;
+                self.mode = Mode::Details { key: key.to_string(), scroll };
+                self.info(format!("{key}: saved {}", field.label().to_lowercase()));
+            }
+            Err(err) => {
+                editor.saving = false;
+                editor.error = Some(err.to_string());
+                self.error(format!("{key}: couldn't save {} — {err}", field.label().to_lowercase()));
+            }
+        }
+    }
+
+    /// The open field editor's text (for `$EDITOR`).
+    pub fn rich_editor_text(&mut self) -> Option<String> {
+        match &mut self.mode {
+            Mode::EditRich(editor) => Some(editor.editor.lines().join("\n")),
+            Mode::Create(form) => form.focused_text().map(|t| t.lines().join("\n")),
+            _ => None,
+        }
+    }
+
+    /// Replace the open field editor's text (back from `$EDITOR`).
+    pub fn set_rich_editor_text(&mut self, text: &str) {
+        match &mut self.mode {
+            Mode::EditRich(editor) => editor.editor = new_text_area(text),
+            Mode::Create(form) => {
+                if let Some(area) = form.focused_text() {
+                    *area = new_text_area(text);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Apply a board that arrived while a move was in progress.
     fn settle(&mut self) {
         if matches!(self.mode, Mode::Board | Mode::Details { .. } | Mode::Help { .. }) {
@@ -728,7 +850,8 @@ impl App {
         }
 
         // `?` opens the keymap from anywhere except while typing in a form field.
-        let typing = matches!(&self.mode, Mode::TransitionForm(form, _) if form.editor.is_some());
+        let typing = matches!(&self.mode, Mode::TransitionForm(form, _) if form.editor.is_some())
+            || matches!(self.mode, Mode::EditRich(_) | Mode::Create(_));
         if key.code == KeyCode::Char('?') && !typing {
             let previous = std::mem::replace(&mut self.mode, Mode::Board);
             self.mode = match previous {
@@ -744,6 +867,8 @@ impl App {
             Mode::Details { .. } => self.handle_details_key(key),
             Mode::Moving(_) => self.handle_move_key(key),
             Mode::TransitionForm(..) => self.handle_form_key(key),
+            Mode::EditRich(_) => self.handle_rich_key(key),
+            Mode::Create(_) => self.handle_create_key(key),
         };
         self.settle();
         action
@@ -848,6 +973,22 @@ impl App {
                 self.focus_card(column, row);
                 Action::None
             }
+            HitTarget::Create(hit) => {
+                let Mode::Create(form) = &mut self.mode else { return Action::None };
+                let outcome = match hit {
+                    CreateHit::Focus(field) => {
+                        form.focus = crate::create::CreateFocus::Field(field);
+                        CreateOutcome::None
+                    }
+                    CreateHit::Pick(field, index) => {
+                        form.choose(field, index);
+                        CreateOutcome::None
+                    }
+                    CreateHit::Submit => form.try_submit(),
+                    CreateHit::Cancel => CreateOutcome::Cancel,
+                };
+                self.create_outcome(outcome)
+            }
             HitTarget::LaneHeader(key) if matches!(self.mode, Mode::Board) => {
                 if self.focus == LaneFocus::Header(key.clone()) {
                     self.toggle_fold();
@@ -948,9 +1089,125 @@ impl App {
             }
             KeyCode::Enter => return self.open_details(),
             KeyCode::Char('m') => return self.begin_move(),
+            KeyCode::Char('c') => return self.begin_create(),
             _ => {}
         }
         Action::None
+    }
+
+    // ----- creating a card --------------------------------------------------
+
+    fn begin_create(&mut self) -> Action {
+        if !self.board_loaded || self.board.project_key.is_empty() {
+            self.error("can't create yet: the board's project isn't known");
+            return Action::None;
+        }
+        // Grouped by epic: default to the epic section the cursor is in.
+        let lane_epic = match (self.grouping, self.focused_lane_key()) {
+            (Grouping::Epic, Some(key)) => self
+                .lanes()
+                .into_iter()
+                .find(|l| l.key == key)
+                .and_then(|l| match l.kind {
+                    lanes::LaneKind::Epic(epic) => Some(epic),
+                    _ => None,
+                }),
+            _ => None,
+        };
+        let form = CreateForm::new(&self.board, lane_epic.as_ref(), self.me.as_ref());
+        let project = form.project_key.clone();
+        let team = form.team_id();
+        self.mode = Mode::Create(Box::new(form));
+        match team {
+            Some(team) => Action::Many(vec![Action::FetchCreateMeta(project), Action::FetchTeamMembers(team)]),
+            None => {
+                if let Mode::Create(form) = &mut self.mode {
+                    form.assignee.loading = false;
+                }
+                Action::FetchCreateMeta(project)
+            }
+        }
+    }
+
+    pub fn on_team_members(&mut self, result: Result<Vec<(String, String)>, String>) {
+        let Mode::Create(form) = &mut self.mode else { return };
+        match result {
+            Ok(members) => {
+                self.user_colors.assign(members.iter().map(|(_, name)| name.as_str()));
+                form.add_members(members);
+            }
+            Err(message) => {
+                form.assignee.loading = false;
+                self.error(format!("couldn't load the team's members: {message}"));
+            }
+        }
+    }
+
+    fn handle_create_key(&mut self, key: KeyEvent) -> Action {
+        let Mode::Create(form) = &mut self.mode else { return Action::None };
+        let outcome = form.handle_key(key);
+        self.create_outcome(outcome)
+    }
+
+    fn create_outcome(&mut self, outcome: CreateOutcome) -> Action {
+        match outcome {
+            CreateOutcome::None => {
+                if let Mode::Create(form) = &self.mode {
+                    if form.confirm_discard {
+                        self.info("press Esc again to discard this ticket");
+                    }
+                }
+                Action::None
+            }
+            CreateOutcome::Cancel => {
+                self.mode = Mode::Board;
+                self.info("create cancelled");
+                Action::None
+            }
+            CreateOutcome::EditExternally => Action::EditExternally,
+            CreateOutcome::Submit(draft) => {
+                self.info(format!("creating {} ticket…", draft.project_key));
+                Action::CreateIssue(draft)
+            }
+        }
+    }
+
+    pub fn on_create_meta(&mut self, result: Result<CreateMeta, String>) {
+        let Mode::Create(form) = &mut self.mode else { return };
+        match result {
+            Ok(meta) => form.meta = Some(meta),
+            Err(message) => form.meta_error = Some(message),
+        }
+    }
+
+    pub fn on_created(&mut self, result: Result<Issue, CreateError>) {
+        let Mode::Create(form) = &mut self.mode else { return };
+        match result {
+            Ok(issue) => {
+                // Only show it if it belongs to what this board displays.
+                let chosen = &form.sprint.chosen;
+                let active = chosen
+                    .key
+                    .as_deref()
+                    .and_then(|k| k.parse::<u64>().ok())
+                    .is_some_and(|id| self.board.sprints.iter().any(|s| s.id == id && s.active));
+                let on_board = self.board.sprints.is_empty() || active;
+                let where_to = if chosen.key.is_some() { chosen.label.clone() } else { "the backlog".into() };
+                let key = issue.key.clone();
+                self.mode = Mode::Board;
+                if on_board && self.board.column_for_status(&issue.status_id).is_some() {
+                    self.on_issue_refreshed(issue);
+                    self.select_key(&key);
+                    self.info(format!("created {key}"));
+                } else {
+                    self.info(format!("created {key} in {where_to} (not shown on this board view)"));
+                }
+            }
+            Err(error) => {
+                form.apply_error(&error);
+                self.error("Jira didn't create the ticket — see the errors in the form");
+            }
+        }
     }
 
     fn handle_help_key(&mut self, key: KeyEvent) -> Action {
@@ -966,11 +1223,12 @@ impl App {
         let Some(issue) = self.selected_issue() else { return Action::None };
         let key = issue.key.clone();
         self.mode = Mode::Details { key: key.clone(), scroll: 0 };
-        if matches!(self.comments.get(&key), None | Some(CommentsState::Failed(_))) {
-            self.comments.insert(key.clone(), CommentsState::Loading);
-            return Action::FetchComments(key);
+        // Always refetch: comments and text may have changed since last time.
+        self.comments.insert(key.clone(), CommentsState::Loading);
+        if !matches!(self.rich.get(&key), Some(RichState::Loaded { .. })) {
+            self.rich.insert(key.clone(), RichState::Loading);
         }
-        Action::None
+        Action::FetchDetails(key)
     }
 
     fn handle_details_key(&mut self, key: KeyEvent) -> Action {
@@ -990,7 +1248,65 @@ impl App {
                 self.mode = Mode::Board;
                 return self.begin_move();
             }
+            KeyCode::Char('e') => self.begin_rich_edit(RichField::Description),
+            KeyCode::Char('a') => self.begin_rich_edit(RichField::AcceptanceCriteria),
             _ => {}
+        }
+        Action::None
+    }
+
+    fn begin_rich_edit(&mut self, field: RichField) {
+        let Mode::Details { key, scroll } = &self.mode else { return };
+        let (key, scroll) = (key.clone(), *scroll);
+        let value = match self.rich.get(&key) {
+            Some(RichState::Loaded { .. }) => self.rich[&key].get(field).cloned().unwrap_or(Value::Null),
+            Some(RichState::Failed(message)) => {
+                return self.error(format!("can't edit: couldn't load {} — {message}", field.label().to_lowercase()));
+            }
+            _ => return self.info(format!("still loading the {}…", field.label().to_lowercase())),
+        };
+        let markdown = markdown::to_markdown(if value.is_null() { None } else { Some(&value) });
+        self.mode = Mode::EditRich(Box::new(RichEditor {
+            key,
+            field,
+            editor: new_text_area(&markdown.text),
+            original: markdown.text.clone(),
+            markdown,
+            saving: false,
+            error: None,
+            details_scroll: scroll,
+        }));
+    }
+
+    fn handle_rich_key(&mut self, key: KeyEvent) -> Action {
+        let Mode::EditRich(editor) = &mut self.mode else { return Action::None };
+        if editor.saving {
+            return Action::None;
+        }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => {
+                let (key, scroll) = (editor.key.clone(), editor.details_scroll);
+                self.mode = Mode::Details { key, scroll };
+                self.info("edit cancelled");
+            }
+            KeyCode::Char('g') if ctrl => return Action::EditExternally,
+            KeyCode::Char('s') if ctrl => {
+                let text = editor.editor.lines().join("\n");
+                if text == editor.original {
+                    let (key, scroll) = (editor.key.clone(), editor.details_scroll);
+                    self.mode = Mode::Details { key, scroll };
+                    self.info("no changes");
+                    return Action::None;
+                }
+                editor.saving = true;
+                editor.error = None;
+                let value = markdown::to_adf(&text, &editor.markdown.tokens);
+                return Action::SaveRich { key: editor.key.clone(), field: editor.field, value };
+            }
+            _ => {
+                editor.editor.input(key);
+            }
         }
         Action::None
     }
@@ -1156,6 +1472,11 @@ impl App {
     }
 }
 
+/// A text area holding `text`, cursor at the start.
+fn new_text_area(text: &str) -> TextArea<'static> {
+    TextArea::new(text.replace("\r\n", "\n").split('\n').map(str::to_owned).collect())
+}
+
 fn contains(area: Rect, x: u16, y: u16) -> bool {
     x >= area.x && x < area.x + area.width && y >= area.y && y < area.y + area.height
 }
@@ -1233,6 +1554,92 @@ mod tests {
         assert!(app.can_restart());
         app.handle_key(KeyEvent::from(KeyCode::Char('m')));
         assert!(!app.can_restart());
+    }
+
+    fn open_with_description(app: &mut App) {
+        app.handle_key(KeyEvent::from(KeyCode::Enter)); // details for A-1
+        let doc = serde_json::json!({"type": "doc", "version": 1, "content": [
+            {"type": "paragraph", "content": [{"type": "text", "text": "Old text"}]}
+        ]});
+        app.on_rich("A-1", Ok((doc, Value::Null)));
+    }
+
+    #[test]
+    fn editing_a_description_saves_markdown_as_adf() {
+        let mut app = app();
+        open_with_description(&mut app);
+        press(&mut app, 'e');
+        let Mode::EditRich(editor) = &mut app.mode else { panic!("editor should open") };
+        assert_eq!(editor.original, "Old text");
+        editor.editor = new_text_area("New **bold** text");
+        let action = app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        let Action::SaveRich { key, field, value } = action else { panic!("should save") };
+        assert_eq!((key.as_str(), field), ("A-1", RichField::Description));
+        assert_eq!(value["content"][0]["content"][1]["marks"][0]["type"], "strong");
+
+        app.on_rich_updated("A-1", RichField::Description, Ok(value));
+        assert!(matches!(app.mode, Mode::Details { .. }));
+        assert_eq!(app.board.issue("A-1").unwrap().description, "New bold text");
+    }
+
+    #[test]
+    fn unchanged_text_does_not_save_and_errors_keep_the_editor_open() {
+        let mut app = app();
+        open_with_description(&mut app);
+        press(&mut app, 'e');
+        let none = app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(matches!(none, Action::None));
+        assert!(matches!(app.mode, Mode::Details { .. }), "no changes closes without a request");
+
+        press(&mut app, 'e');
+        if let Mode::EditRich(editor) = &mut app.mode {
+            editor.editor = new_text_area("changed");
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        let mut err = JiraError::default();
+        err.messages.push("Field is not editable".into());
+        app.on_rich_updated("A-1", RichField::Description, Err(err));
+        let Mode::EditRich(editor) = &app.mode else { panic!("editor stays open") };
+        assert!(!editor.saving);
+        assert_eq!(editor.editor.lines(), ["changed"]);
+        assert!(editor.error.as_deref().unwrap().contains("not editable"));
+    }
+
+    #[test]
+    fn typing_a_question_mark_in_the_editor_does_not_open_help() {
+        let mut app = app();
+        open_with_description(&mut app);
+        press(&mut app, 'e');
+        press(&mut app, '?');
+        assert!(matches!(app.mode, Mode::EditRich(_)));
+    }
+
+    #[test]
+    fn c_opens_the_create_dialog_and_a_created_card_lands_on_the_board() {
+        let mut app = app();
+        app.board.project_key = "DEMO".into();
+        app.board.columns[0].status_ids = vec!["1".into()];
+        let action = app.handle_key(KeyEvent::from(KeyCode::Char('c')));
+        assert!(matches!(action, Action::FetchCreateMeta(ref p) if p == "DEMO"));
+        assert!(matches!(app.mode, Mode::Create(_)));
+        // `?` types into the dialog rather than opening the keymap.
+        press(&mut app, '?');
+        assert!(matches!(app.mode, Mode::Create(_)));
+
+        let created = Issue { key: "DEMO-9".into(), status_id: "1".into(), ..Default::default() };
+        app.on_created(Ok(created));
+        assert!(matches!(app.mode, Mode::Board));
+        assert_eq!(selected(&app).as_deref(), Some("DEMO-9"));
+    }
+
+    #[test]
+    fn grouped_by_epic_the_dialog_defaults_to_the_current_section() {
+        let mut app = app();
+        app.board.project_key = "DEMO".into();
+        press(&mut app, 'g'); // grouped by epic; cursor in lane A
+        app.handle_key(KeyEvent::from(KeyCode::Char('c')));
+        let Mode::Create(form) = &app.mode else { panic!("dialog should open") };
+        assert_eq!(form.epic.chosen.key.as_deref(), Some("E-A"));
     }
 
     #[test]
@@ -1347,7 +1754,7 @@ mod tests {
         click(&mut app, HitTarget::Card { column: 1, row: 0 });
         assert_eq!(selected(&app).as_deref(), Some("A-2"));
         assert!(matches!(app.mode, Mode::Board));
-        assert!(matches!(click(&mut app, HitTarget::Card { column: 1, row: 0 }), Action::FetchComments(_)));
+        assert!(matches!(click(&mut app, HitTarget::Card { column: 1, row: 0 }), Action::FetchDetails(_)));
         assert!(matches!(app.mode, Mode::Details { .. }));
         // Cards under the open modal aren't clickable.
         click(&mut app, HitTarget::Card { column: 0, row: 0 });

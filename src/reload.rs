@@ -110,7 +110,7 @@ mod tests {
             candidate: None,
             last_check: Instant::now() - CHECK_EVERY,
         };
-        let mut check = |watch: &mut BinaryWatch| {
+        let check = |watch: &mut BinaryWatch| {
             watch.last_check = Instant::now() - CHECK_EVERY;
             watch.replaced()
         };

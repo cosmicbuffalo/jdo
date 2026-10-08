@@ -13,12 +13,14 @@ use super::adf;
 use super::wire::{BoardConfig, RawComment, RawIssue, RawTransition};
 use crate::config::FieldMap;
 use crate::model::{
-    AllowedValue, Board, Column, Comment, Constraint, EpicRef, Issue, ScreenField, Transition,
+    AllowedValue, Board, Column, Comment, Constraint, EpicRef, Issue, ScreenField, SprintRef, TeamRef, Transition,
 };
 
 pub fn build_board(
     config: BoardConfig,
     scope: String,
+    project_key: String,
+    sprints: Vec<SprintRef>,
     raw: Vec<RawIssue>,
     fields: &FieldMap,
     browse_base: &str,
@@ -70,6 +72,8 @@ pub fn build_board(
     Board {
         name: config.name,
         scope,
+        project_key,
+        sprints,
         columns,
         constraint,
     }
@@ -100,6 +104,7 @@ pub fn map_issue(raw: &RawIssue, fields: &FieldMap, browse_base: &str) -> Issue 
         status: name_of("status", "name").unwrap_or_default(),
         status_id: name_of("status", "id").unwrap_or_default(),
         assignee: name_of("assignee", "displayName"),
+        assignee_id: name_of("assignee", "accountId"),
         priority: name_of("priority", "name"),
         labels: f
             .get("labels")
@@ -110,6 +115,12 @@ pub fn map_issue(raw: &RawIssue, fields: &FieldMap, browse_base: &str) -> Issue 
         acceptance_criteria: adf::to_text(f.get(&fields.acceptance_criteria)),
         story_points: f.get(&fields.story_points).and_then(Value::as_f64),
         sprint: active_sprint_name(f.get(&fields.sprint)),
+        team: f.get(&fields.team).and_then(|t| {
+            Some(TeamRef {
+                id: t.get("id")?.as_str()?.to_string(),
+                name: t.get("name").or_else(|| t.get("title")).and_then(Value::as_str).unwrap_or("team").to_string(),
+            })
+        }),
         epic: epic_of(f, fields),
         url: format!("{}/browse/{}", browse_base.trim_end_matches('/'), raw.key),
         sync_state: Default::default(),

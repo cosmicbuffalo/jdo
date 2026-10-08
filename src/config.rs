@@ -39,6 +39,7 @@ pub struct FieldMap {
     pub acceptance_criteria: String,
     pub sprint: String,
     pub epic_link: String,
+    pub team: String,
 }
 
 impl Default for JiraConfig {
@@ -62,6 +63,7 @@ impl Default for FieldMap {
             acceptance_criteria: "customfield_10035".into(),
             sprint: "customfield_10020".into(),
             epic_link: "customfield_10014".into(),
+            team: "customfield_10001".into(),
         }
     }
 }

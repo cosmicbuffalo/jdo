@@ -9,4 +9,5 @@ pub mod auth;
 pub mod client;
 pub mod fields;
 pub mod mapping;
+pub mod markdown;
 pub mod wire;

@@ -86,11 +86,11 @@ impl JiraClient {
         resp.json::<T>().with_context(|| format!("parse {what}"))
     }
 
-    /// POST a JSON body, mapping a non-2xx response to a structured [`JiraError`].
-    fn post_json(&self, url: &str, body: &Value) -> std::result::Result<(), JiraError> {
+    /// Send a JSON body, mapping a non-2xx response to a structured [`JiraError`].
+    fn write_json(&self, request: reqwest::blocking::RequestBuilder, body: &Value) -> std::result::Result<(), JiraError> {
         let resp = self
             .auth
-            .apply(self.http.post(url))
+            .apply(request)
             .json(body)
             .send()
             .map_err(|e| JiraError::message(format!("network error: {e}")))?;
@@ -98,19 +98,7 @@ impl JiraClient {
         if status.is_success() {
             return Ok(());
         }
-        let text = resp.text().unwrap_or_default();
-        match serde_json::from_str::<ErrorBody>(&text) {
-            Ok(body) if !body.error_messages.is_empty() || !body.errors.is_empty() => {
-                Err(JiraError {
-                    messages: body.error_messages,
-                    field_errors: body.errors,
-                })
-            }
-            _ => Err(JiraError::message(format!(
-                "HTTP {status} — {}",
-                truncate(&text, 300)
-            ))),
-        }
+        Err(error_from(status, &resp.text().unwrap_or_default()))
     }
 
     /// Board columns + their status mapping.
@@ -123,9 +111,79 @@ impl JiraClient {
         self.get_json(&self.url(&format!("/rest/agile/1.0/board/{board_id}")), "board")
     }
 
-    pub fn active_sprints(&self, board_id: u64) -> Result<Vec<Sprint>> {
-        let url = self.url(&format!("/rest/agile/1.0/board/{board_id}/sprint?state=active"));
-        Ok(self.get_json::<SprintPage>(&url, "active sprints")?.values)
+    /// Active and future sprints, in the board's order.
+    pub fn open_sprints(&self, board_id: u64) -> Result<Vec<Sprint>> {
+        let url = self.url(&format!("/rest/agile/1.0/board/{board_id}/sprint?state=active,future"));
+        Ok(self.get_json::<SprintPage>(&url, "sprints")?.values)
+    }
+
+    /// Creatable issue types for a project: `(id, name)`.
+    pub fn create_issue_types(&self, project: &str) -> Result<Vec<(String, String)>> {
+        let url = self.url(&format!("/rest/api/3/issue/createmeta/{project}/issuetypes"));
+        let page: Value = self.get_json(&url, "create metadata")?;
+        let types = page["issueTypes"].as_array().or_else(|| page["values"].as_array()).cloned().unwrap_or_default();
+        Ok(types
+            .iter()
+            .filter_map(|t| Some((t["id"].as_str()?.to_string(), t["name"].as_str()?.to_string())))
+            .collect())
+    }
+
+    /// The fields Jira offers (and requires) when creating this issue type.
+    pub fn create_fields(&self, project: &str, issue_type: &str) -> Result<Vec<Value>> {
+        let url = self.url(&format!("/rest/api/3/issue/createmeta/{project}/issuetypes/{issue_type}?maxResults=200"));
+        let page: Value = self.get_json(&url, "create fields")?;
+        Ok(page["fields"].as_array().or_else(|| page["values"].as_array()).cloned().unwrap_or_default())
+    }
+
+    /// People assigned to the team's issues in the last six months, as
+    /// `(accountId, displayName)` — the team's roster as Jira sees it (the
+    /// Teams service itself isn't reachable with an API token).
+    pub fn team_members(&self, team_field: &str, team_id: &str) -> Result<Vec<(String, String)>> {
+        let number = team_field.trim_start_matches("customfield_");
+        let jql = format!("cf[{number}] = {team_id} AND assignee is not EMPTY AND updated >= -180d");
+        let mut people: Vec<(String, String)> = Vec::new();
+        let mut token: Option<String> = None;
+        for _ in 0..5 {
+            let mut url = self.url(&format!("/rest/api/3/search/jql?fields=assignee&maxResults=100&jql={}", encode(&jql)));
+            if let Some(t) = &token {
+                url.push_str(&format!("&nextPageToken={}", encode(t)));
+            }
+            let page: Value = self.get_json(&url, "team members")?;
+            for issue in page["issues"].as_array().into_iter().flatten() {
+                let who = &issue["fields"]["assignee"];
+                if let (Some(id), Some(name)) = (who["accountId"].as_str(), who["displayName"].as_str()) {
+                    if !people.iter().any(|(i, _)| i == id) {
+                        people.push((id.to_string(), name.to_string()));
+                    }
+                }
+            }
+            token = page["nextPageToken"].as_str().map(str::to_string);
+            if token.is_none() {
+                break;
+            }
+        }
+        Ok(people)
+    }
+
+    /// Create an issue; returns its key.
+    pub fn create_issue(&self, fields: Value) -> std::result::Result<String, JiraError> {
+        let url = self.url("/rest/api/3/issue");
+        let resp = self
+            .auth
+            .apply(self.http.post(url))
+            .json(&serde_json::json!({ "fields": fields }))
+            .send()
+            .map_err(|e| JiraError::message(format!("network error: {e}")))?;
+        let status = resp.status();
+        let text = resp.text().unwrap_or_default();
+        if status.is_success() {
+            let body: Value = serde_json::from_str(&text).unwrap_or_default();
+            return body["key"]
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| JiraError::message("Jira didn't return the new issue's key"));
+        }
+        Err(error_from(status, &text))
     }
 
     /// All issues on the board matching `jql` (if any), following pagination.
@@ -180,7 +238,13 @@ impl JiraClient {
     /// `{"transition": {"id"}, "fields": {...}, "update": {...}}`.
     pub fn do_transition(&self, key: &str, body: &Value) -> std::result::Result<(), JiraError> {
         let url = self.url(&format!("/rest/api/3/issue/{key}/transitions"));
-        self.post_json(&url, body)
+        self.write_json(self.http.post(url), body)
+    }
+
+    /// Set fields on an issue: `fields` is `{field_id: value, ...}`.
+    pub fn update_fields(&self, key: &str, fields: Value) -> std::result::Result<(), JiraError> {
+        let url = self.url(&format!("/rest/api/3/issue/{key}"));
+        self.write_json(self.http.put(url), &serde_json::json!({ "fields": fields }))
     }
 
     /// Comments, oldest first (Jira's default order).
@@ -193,6 +257,16 @@ impl JiraClient {
 
     pub fn myself(&self) -> Result<Myself> {
         self.get_json(&self.url("/rest/api/3/myself"), "current user")
+    }
+}
+
+/// Jira's error body as a [`JiraError`], or the raw response if it isn't one.
+fn error_from(status: reqwest::StatusCode, text: &str) -> JiraError {
+    match serde_json::from_str::<ErrorBody>(text) {
+        Ok(body) if !body.error_messages.is_empty() || !body.errors.is_empty() => {
+            JiraError { messages: body.error_messages, field_errors: body.errors }
+        }
+        _ => JiraError::message(format!("HTTP {status} — {}", truncate(text, 300))),
     }
 }
 
