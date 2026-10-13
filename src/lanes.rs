@@ -99,16 +99,17 @@ fn lane_kind(issue: &Issue, grouping: Grouping) -> LaneKind {
     }
 }
 
-/// Build lanes, sorted by name with the "no epic" / "unassigned" lane last.
-/// An ungrouped board is one lane holding everything.
-pub fn build(board: &Board, grouping: Grouping) -> Vec<Lane> {
+/// Build lanes from the issues `keep` accepts, sorted by name with the
+/// "no epic" / "unassigned" lane last. Lanes with nothing kept don't appear;
+/// an ungrouped board is one lane holding everything kept.
+pub fn build(board: &Board, grouping: Grouping, keep: impl Fn(&Issue) -> bool) -> Vec<Lane> {
     let columns = board.columns.len();
     let mut lanes: Vec<Lane> = Vec::new();
     if grouping == Grouping::None {
         lanes.push(Lane { key: "all".into(), kind: LaneKind::All, cells: vec![Vec::new(); columns] });
     }
     for (ci, column) in board.columns.iter().enumerate() {
-        for (ri, issue) in column.issues.iter().enumerate() {
+        for (ri, issue) in column.issues.iter().enumerate().filter(|(_, i)| keep(i)) {
             let key = lane_key(issue, grouping);
             let index = match lanes.iter().position(|l| l.key == key) {
                 Some(i) => i,
@@ -155,7 +156,7 @@ mod tests {
 
     #[test]
     fn epic_lanes_sort_by_name_with_no_epic_last() {
-        let lanes = build(&board(), Grouping::Epic);
+        let lanes = build(&board(), Grouping::Epic, |_| true);
         let keys: Vec<&str> = lanes.iter().map(|l| l.key.as_str()).collect();
         assert_eq!(keys, ["epic:E-Alpha", "epic:E-Zeta", "epic:-"]);
         // Zeta: A-1 in column 0, A-4 (row 1) in column 1.
@@ -165,15 +166,22 @@ mod tests {
 
     #[test]
     fn assignee_lanes_sort_case_insensitively_with_unassigned_last() {
-        let keys: Vec<String> = build(&board(), Grouping::Assignee).into_iter().map(|l| l.key).collect();
+        let keys: Vec<String> = build(&board(), Grouping::Assignee, |_| true).into_iter().map(|l| l.key).collect();
         assert_eq!(keys, ["user:Al", "user:bo", "user:-"]);
     }
 
     #[test]
     fn ungrouped_is_one_lane_with_every_issue() {
-        let lanes = build(&board(), Grouping::None);
+        let lanes = build(&board(), Grouping::None, |_| true);
         assert_eq!(lanes.len(), 1);
         assert_eq!(lanes[0].cells, vec![vec![0, 1], vec![0, 1]]);
+    }
+
+    #[test]
+    fn filtered_out_issues_leave_no_empty_lanes() {
+        let lanes = build(&board(), Grouping::Epic, |i| i.assignee.as_deref() == Some("Al"));
+        assert_eq!(lanes.len(), 1);
+        assert_eq!(lanes[0].key, "epic:E-Alpha");
     }
 
     #[test]

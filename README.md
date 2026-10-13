@@ -22,6 +22,7 @@ A running `jdo` notices when it is reinstalled and restarts itself into the new 
 - **Board** — scrum boards show the active sprint (kanban boards apply the board's sub-filter), with the board's own columns and WIP limits: a column over its max (or under its min) gets a red (amber) title row and border.
 - **Cards** — key, summary, epic (in the epic's Jira color), points (`? pts` when unestimated) and a distinct colored assignee pill (red `Unassigned` when nobody owns it).
 - **Grouping** — `g` cycles none → epic → assignee. Each group is a foldable section with a complete board of its own.
+- **Only mine** — `a` on the board shows only cards assigned to you (press again for everyone's); works with grouping and survives a reinstall restart.
 - **Details** — `Enter` opens a card: fields, description, acceptance criteria, comments.
 - **Editing** — in details, `e` / `a` edit the description / acceptance criteria as Markdown (`Ctrl-G` for `$EDITOR`). Headings, lists, code, quotes, links and bold/italic round-trip; tables, mentions and the like are kept as `⟦n:…⟧` placeholders and restored on save.
 - **Move mode** — `m` loads the card's workflow; only columns it can legally move to light up. Transitions with screens open a form pre-filled with the issue's values; Jira's validator errors land on the offending fields.
@@ -38,6 +39,7 @@ A running `jdo` notices when it is reinstalled and restarts itself into the new 
 | `c` | create a card (`Tab` between fields, `Ctrl-S` submit, `Esc` cancel) |
 | `e` / `a` | in details: edit description / acceptance criteria (`Ctrl-S` save) |
 | `g` | group: none → epic → assignee |
+| `a` | on the board: show only your cards / everyone's |
 | `z` / `Z` | fold the section / all sections |
 | `Home` / `End` | first / last card |
 | `r` | refresh |

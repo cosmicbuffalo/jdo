@@ -191,6 +191,8 @@ pub struct App {
     /// First visible column when the board is wider than the terminal.
     pub lane_offset: usize,
     pub grouping: Grouping,
+    /// Show only cards assigned to the signed-in user.
+    pub mine_only: bool,
     /// Folded lane keys (kept across refreshes and regrouping).
     pub folded: HashSet<String>,
     pub focus: LaneFocus,
@@ -235,6 +237,7 @@ impl App {
             column_scroll: Vec::new(),
             lane_offset: 0,
             grouping: Grouping::None,
+            mine_only: false,
             folded: HashSet::new(),
             focus: LaneFocus::Card,
             in_gutter: false,
@@ -287,26 +290,61 @@ impl App {
         if self.focus != LaneFocus::Card {
             return None;
         }
-        self.current_column()?.issues.get(self.selected_row)
+        self.current_column()?.issues.get(self.selected_row).filter(|i| self.visible(i))
+    }
+
+    /// Whether the "only mine" filter shows this card.
+    pub fn visible(&self, issue: &Issue) -> bool {
+        !self.mine_only || self.me.as_ref().is_some_and(|(id, _)| issue.assignee_id.as_deref() == Some(id.as_str()))
+    }
+
+    /// Row indices of a column's visible cards.
+    pub fn visible_rows(&self, column: usize) -> Vec<usize> {
+        self.board
+            .columns
+            .get(column)
+            .map(|c| c.issues.iter().enumerate().filter(|(_, i)| self.visible(i)).map(|(r, _)| r).collect())
+            .unwrap_or_default()
+    }
+
+    fn toggle_mine(&mut self) {
+        if self.me.is_none() {
+            return self.error("can't filter yet: jdo doesn't know who you are (Jira's /myself failed)");
+        }
+        let selected = self.selected_issue().map(|i| i.key.clone());
+        self.mine_only = !self.mine_only;
+        self.board_scroll = 0;
+        if !selected.is_some_and(|key| self.select_key(&key)) {
+            self.clamp_selection();
+            self.ensure_focus();
+        }
+        if self.mine_only {
+            match self.board.columns.iter().flat_map(|c| &c.issues).filter(|i| self.visible(i)).count() {
+                0 => self.info("no cards on this board are assigned to you — press a to show everyone's"),
+                n => self.info(format!("showing only your cards ({n}) — press a to show everyone's")),
+            }
+        } else {
+            self.info("showing everyone's cards");
+        }
     }
 
     fn select_key(&mut self, key: &str) -> bool {
         match self.board.find(key) {
-            Some((c, r)) => {
+            Some((c, r)) if self.visible(&self.board.columns[c].issues[r]) => {
                 self.selected_column = c;
                 self.selected_row = r;
                 self.focus = LaneFocus::Card;
                 self.ensure_focus();
                 true
             }
-            None => false,
+            _ => false,
         }
     }
 
     // ----- lanes -----------------------------------------------------------
 
     pub fn lanes(&self) -> Vec<Lane> {
-        lanes::build(&self.board, self.grouping)
+        lanes::build(&self.board, self.grouping, |i| self.visible(i))
     }
 
     pub fn is_grouped(&self) -> bool {
@@ -342,8 +380,11 @@ impl App {
             return;
         }
         let lanes = self.lanes();
+        // A card the filter hides: fall back to its lane's header (or the first).
+        let hidden = self.focus == LaneFocus::Card
+            && self.current_column().and_then(|c| c.issues.get(self.selected_row)).is_some_and(|i| !self.visible(i));
         match self.focused_lane(&lanes) {
-            Some(i) if self.focus == LaneFocus::Card && self.is_folded(&lanes[i]) => {
+            Some(i) if hidden || (self.focus == LaneFocus::Card && self.is_folded(&lanes[i])) => {
                 self.focus = LaneFocus::Header(lanes[i].key.clone());
             }
             Some(_) => {}
@@ -542,12 +583,15 @@ impl App {
         }
     }
 
+    /// Keep the selection on a visible card: the nearest one at or above the
+    /// current row, else the nearest below.
     fn clamp_selection(&mut self) {
         self.selected_column = self
             .selected_column
             .min(self.board.columns.len().saturating_sub(1));
-        let rows = self.current_column().map(|c| c.issues.len()).unwrap_or(0);
-        self.selected_row = self.selected_row.min(rows.saturating_sub(1));
+        let rows = self.visible_rows(self.selected_column);
+        let row = self.selected_row;
+        self.selected_row = rows.iter().rev().find(|&&r| r <= row).or(rows.first()).copied().unwrap_or(0);
     }
 
     fn select_column(&mut self, delta: isize) {
@@ -559,12 +603,15 @@ impl App {
         self.clamp_selection();
     }
 
+    /// Step through the column's visible cards.
     fn select_row(&mut self, delta: isize) {
-        let rows = self.current_column().map(|c| c.issues.len()).unwrap_or(0);
-        if rows == 0 {
+        let rows = self.visible_rows(self.selected_column);
+        if rows.is_empty() {
             return;
         }
-        self.selected_row = (self.selected_row as isize + delta).clamp(0, rows as isize - 1) as usize;
+        let at = rows.iter().position(|&r| r == self.selected_row).unwrap_or(0) as isize;
+        let next = (at + delta).clamp(0, rows.len() as isize - 1) as usize;
+        self.selected_row = rows[next];
     }
 
     // ----- network results -------------------------------------------------
@@ -893,6 +940,7 @@ impl App {
         };
         serde_json::json!({
             "grouping": self.grouping.as_str(),
+            "mine_only": self.mine_only,
             "folded": folded,
             "selected": self.selected_issue().map(|i| i.key.clone()),
             "focus": focus,
@@ -907,6 +955,7 @@ impl App {
     pub fn apply_resume(&mut self, state: &str) {
         let Ok(state) = serde_json::from_str::<Value>(state) else { return };
         self.grouping = Grouping::parse(state["grouping"].as_str().unwrap_or_default());
+        self.mine_only = state["mine_only"].as_bool().unwrap_or(false);
         self.folded = state["folded"]
             .as_array()
             .map(|keys| keys.iter().filter_map(Value::as_str).map(str::to_string).collect())
@@ -1064,6 +1113,7 @@ impl App {
         }
         match key.code {
             KeyCode::Char('g') => self.cycle_grouping(),
+            KeyCode::Char('a') => self.toggle_mine(),
             KeyCode::Char('q') => return Action::Quit,
             KeyCode::Char('r') => {
                 if self.board_loaded {
@@ -1078,7 +1128,7 @@ impl App {
             KeyCode::Char('l') | KeyCode::Right => self.select_column(1),
             KeyCode::Char('k') | KeyCode::Up => self.select_row(-1),
             KeyCode::Char('j') | KeyCode::Down => self.select_row(1),
-            KeyCode::Home => self.selected_row = 0,
+            KeyCode::Home => self.select_row(isize::MIN / 2),
             KeyCode::End => self.select_row(isize::MAX / 2),
             KeyCode::Char(c @ '1'..='9') => {
                 let index = c as usize - '1' as usize;
@@ -1640,6 +1690,54 @@ mod tests {
         app.handle_key(KeyEvent::from(KeyCode::Char('c')));
         let Mode::Create(form) = &app.mode else { panic!("dialog should open") };
         assert_eq!(form.epic.chosen.key.as_deref(), Some("E-A"));
+    }
+
+    /// A-1 and B-2 are mine; A-2 and B-1 belong to someone else.
+    fn mine_app() -> App {
+        let mut app = app();
+        app.me = Some(("acct-me".into(), "Me".into()));
+        for key in ["A-1", "B-2"] {
+            app.board.issue_mut(key).unwrap().assignee_id = Some("acct-me".into());
+        }
+        app
+    }
+
+    #[test]
+    fn a_toggles_showing_only_my_cards() {
+        let mut app = mine_app();
+        press(&mut app, 'j'); // B-1 (not mine)
+        press(&mut app, 'a');
+        assert!(app.mine_only);
+        assert_eq!(selected(&app).as_deref(), Some("A-1"), "moves off a hidden card");
+        press(&mut app, 'j'); // skips B-1
+        assert_eq!(selected(&app).as_deref(), Some("B-2"));
+        press(&mut app, 'l'); // column 1 has only A-2: nothing of mine
+        assert_eq!(selected(&app), None);
+        press(&mut app, 'a');
+        assert!(!app.mine_only);
+        assert_eq!(selected(&app).as_deref(), Some("A-2"));
+    }
+
+    #[test]
+    fn grouped_lanes_only_hold_my_cards() {
+        let mut app = mine_app();
+        press(&mut app, 'g');
+        press(&mut app, 'a');
+        let lanes = app.lanes();
+        assert_eq!(lanes.iter().map(|l| l.count()).sum::<usize>(), 2);
+        assert_eq!(lanes[0].cells, vec![vec![0], vec![]], "lane A: A-1 only");
+    }
+
+    #[test]
+    fn the_filter_needs_to_know_who_i_am_and_survives_a_restart() {
+        let mut app = app();
+        press(&mut app, 'a');
+        assert!(!app.mine_only);
+        let mut app = mine_app();
+        press(&mut app, 'a');
+        let mut after = App::new(Board::default(), 1);
+        after.apply_resume(&app.resume_state());
+        assert!(after.mine_only);
     }
 
     #[test]

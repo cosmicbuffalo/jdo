@@ -86,8 +86,15 @@ fn draw_title(frame: &mut Frame, area: Rect, app: &App) {
     if !app.board.scope.is_empty() {
         spans.push(Span::styled(format!(" · {}", app.board.scope), Style::default().fg(MUTED)));
     }
+    let mut view = Vec::new();
     if app.is_grouped() {
-        spans.push(Span::styled(format!(" ({})", app.grouping.label()), Style::default().fg(ACCENT)));
+        view.push(app.grouping.label());
+    }
+    if app.mine_only {
+        view.push("only mine");
+    }
+    if !view.is_empty() {
+        spans.push(Span::styled(format!(" ({})", view.join(" · ")), Style::default().fg(ACCENT)));
     }
     let gutter = if app.is_grouped() { GUTTER } else { 0 };
     let visible = visible_lane_count(area.width.saturating_sub(gutter), app.board.columns.len());
@@ -133,6 +140,11 @@ fn draw_board(frame: &mut Frame, area: Rect, app: &mut App) {
     app.lane_offset = app.lane_offset.min(count - visible);
     app.column_scroll.resize(count, 0);
 
+    if app.mine_only && !app.board.columns.iter().flat_map(|c| &c.issues).any(|i| app.visible(i)) {
+        draw_none_of_mine(frame, area, app);
+        return;
+    }
+
     let slots = Layout::horizontal(vec![Constraint::Ratio(1, visible as u32); visible]).split(columns_area);
     let columns: Vec<usize> = (app.lane_offset..app.lane_offset + visible).collect();
     if app.is_grouped() {
@@ -142,6 +154,29 @@ fn draw_board(frame: &mut Frame, area: Rect, app: &mut App) {
     for (slot, &column_index) in columns.iter().enumerate() {
         draw_column(frame, slots[slot], app, column_index);
     }
+}
+
+/// "Only mine" with nothing of mine on the board: say so, and how to get back.
+fn draw_none_of_mine(frame: &mut Frame, area: Rect, app: &mut App) {
+    let who = app.me.as_ref().map(|(_, name)| format!(" ({name})")).unwrap_or_default();
+    let label = "  a  show everyone's cards  ";
+    let lines = vec![
+        Line::styled(
+            format!("No cards on this board are assigned to you{who}."),
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+        ),
+        Line::styled("The board is filtered to only your cards.", Style::default().fg(MUTED)),
+        Line::raw(""),
+        Line::from(Span::styled(label, Style::default().fg(BACKGROUND).bg(ACCENT).add_modifier(Modifier::BOLD))),
+    ];
+    let y = area.y + area.height.saturating_sub(lines.len() as u16) / 2;
+    frame.render_widget(
+        Paragraph::new(lines).alignment(Alignment::Center),
+        Rect::new(area.x, y, area.width, 4.min(area.height)),
+    );
+    let width = label.width() as u16;
+    let button = Rect::new(area.x + area.width.saturating_sub(width) / 2, y + 3, width, 1);
+    app.hits.push(Hit { area: button, target: HitTarget::Key(KeyEvent::from(KeyCode::Char('a'))) });
 }
 
 /// The single loading indicator: a spinner (or the failure) centered on the board.
@@ -282,7 +317,10 @@ fn column_frame(buf: &mut Buffer, area: Rect, app: &App, ci: usize, active: bool
 }
 
 fn draw_column(frame: &mut Frame, area: Rect, app: &mut App, ci: usize) {
-    let inner = column_frame(frame.buffer_mut(), area, app, ci, true, None);
+    // Filtered to my cards, the title counts what's shown.
+    let visible = app.visible_rows(ci);
+    let shown = app.mine_only.then_some(visible.len());
+    let inner = column_frame(frame.buffer_mut(), area, app, ci, true, shown);
     if inner.height == 0 || inner.width < 4 {
         return;
     }
@@ -290,29 +328,29 @@ fn draw_column(frame: &mut Frame, area: Rect, app: &mut App, ci: usize) {
     let selected_col = ci == app.selected_column;
     let column = &app.board.columns[ci];
 
-    if column.issues.is_empty() {
-        frame.render_widget(Paragraph::new("  (empty)").style(Style::default().fg(MUTED)), inner);
+    if visible.is_empty() {
+        let text = if column.issues.is_empty() { "  (empty)" } else { "  (none of yours)" };
+        frame.render_widget(Paragraph::new(text).style(Style::default().fg(MUTED)), inner);
         return;
     }
 
     let moving = matches!(app.mode, Mode::Moving(_));
     let dim = role == MoveRole::Unreachable;
-    let cards: Vec<Vec<Line<'static>>> = column
-        .issues
+    let cards: Vec<Vec<Line<'static>>> = visible
         .iter()
-        .enumerate()
-        .map(|(ri, issue)| {
+        .map(|&ri| {
             let selected = selected_col && ri == app.selected_row;
-            card_lines(issue, inner.width, selected, selected && moving, dim, true, true, &app.user_colors)
+            card_lines(&column.issues[ri], inner.width, selected, selected && moving, dim, true, true, &app.user_colors)
         })
         .collect();
 
     // Keep the selected card visible, reserving rows for the ↑/↓ hints.
+    // Positions below are into `visible`/`cards`, not the column.
     let len = cards.len();
     let height = inner.height as usize;
     let mut offset = app.column_scroll[ci].min(len - 1);
     if selected_col {
-        let sel = app.selected_row.min(len - 1);
+        let sel = visible.iter().position(|&r| r == app.selected_row).unwrap_or(0);
         offset = offset.min(sel);
         while offset < sel {
             let needed: usize = cards[offset..=sel].iter().map(Vec::len).sum::<usize>()
@@ -347,7 +385,7 @@ fn draw_column(frame: &mut Frame, area: Rect, app: &mut App, ci: usize) {
         let rows = card_height.min(bottom.saturating_sub(y));
         let card_area = Rect::new(inner.x, y, inner.width, rows);
         frame.render_widget(Paragraph::new(card.clone()), card_area);
-        app.hits.push(Hit { area: card_area, target: HitTarget::Card { column: ci, row: i } });
+        app.hits.push(Hit { area: card_area, target: HitTarget::Card { column: ci, row: visible[i] } });
         y += rows;
         if y >= bottom {
             break;
@@ -529,7 +567,9 @@ fn draw_grouped(frame: &mut Frame, area: Rect, columns: &[usize], slots: &[Rect]
     let mut canvas = Buffer::empty(Rect::new(area.x, 0, area.width, total as u16));
     let mut hits: Vec<(Rect, HitTarget)> = Vec::new();
     let mut cursor = (0, 1);
-    for (lane, section) in lanes.iter().zip(&sections) {
+    // The section the cursor is in: (index into `lanes`, its header's line).
+    let mut anchor: Option<(usize, usize)> = None;
+    for (li, (lane, section)) in lanes.iter().zip(&sections).enumerate() {
         let header_focused = app.focus == LaneFocus::Header(lane.key.clone());
         let header = Rect::new(area.x, section.y as u16, area.width, 1);
         let marker = header_focused && app.in_gutter;
@@ -540,6 +580,7 @@ fn draw_grouped(frame: &mut Frame, area: Rect, columns: &[usize], slots: &[Rect]
         hits.push((header, HitTarget::LaneHeader(lane.key.clone())));
         if header_focused {
             cursor = (section.y, section.y + 1);
+            anchor = Some((li, section.y));
         }
         if section.folded {
             continue;
@@ -554,8 +595,8 @@ fn draw_grouped(frame: &mut Frame, area: Rect, columns: &[usize], slots: &[Rect]
                 Paragraph::new(lines.clone()).render(card, &mut canvas);
                 hits.push((card, HitTarget::Card { column: ci, row: *ri }));
                 if app.focus == LaneFocus::Card && ci == app.selected_column && *ri == app.selected_row {
-                    // Bring the box's title row into view along with the card.
-                    cursor = (section.y + 1, cy as usize + lines.len());
+                    cursor = (cy as usize, cy as usize + lines.len());
+                    anchor = Some((li, section.y));
                 }
                 cy += lines.len() as u16;
             }
@@ -565,19 +606,29 @@ fn draw_grouped(frame: &mut Frame, area: Rect, columns: &[usize], slots: &[Rect]
                     Span::styled("no cards", Style::default().fg(MUTED)),
                 ]))
                 .render(Rect::new(inner.x, inner.y, inner.width, 1), &mut canvas);
-                cursor = (section.y + 1, inner.y as usize + 1);
+                cursor = (inner.y as usize, inner.y as usize + 1);
+                anchor = Some((li, section.y));
             }
         }
     }
 
-    // Scroll to keep the cursor in view, then copy the window to the screen.
+    // Pin the cursor's section header to the top. If the cursor is further
+    // down than the screen allows, scroll to it and keep the header stuck on
+    // the top row instead.
     let height = area.height as usize;
-    let mut scroll = app.board_scroll.min(total.saturating_sub(height));
-    if cursor.0 < scroll {
-        scroll = cursor.0;
-    } else if cursor.1 > scroll + height {
-        scroll = (cursor.1 - height).min(cursor.0);
-    }
+    let (scroll, sticky) = match anchor {
+        Some((li, header_y)) if cursor.1 > header_y + height => (cursor.1.saturating_sub(height), Some(li)),
+        Some((_, header_y)) => (header_y, None),
+        None => {
+            let mut scroll = app.board_scroll.min(total.saturating_sub(height));
+            if cursor.0 < scroll {
+                scroll = cursor.0;
+            } else if cursor.1 > scroll + height {
+                scroll = cursor.1 - height;
+            }
+            (scroll, None)
+        }
+    };
     app.board_scroll = scroll;
 
     let screen = frame.buffer_mut();
@@ -598,6 +649,18 @@ fn draw_grouped(frame: &mut Frame, area: Rect, columns: &[usize], slots: &[Rect]
                 target,
             });
         }
+    }
+
+    // The sticky header covers the top row (and wins its clicks: hits are
+    // searched last-first).
+    if let Some(li) = sticky {
+        let lane = &lanes[li];
+        let row = Rect::new(area.x, area.y, area.width, 1);
+        Clear.render(row, screen);
+        Paragraph::new(lane_header(lane, false, false, false, &app.user_colors))
+            .style(Style::default().bg(BACKGROUND))
+            .render(row, screen);
+        app.hits.push(Hit { area: row, target: HitTarget::LaneHeader(lane.key.clone()) });
     }
 }
 
@@ -679,6 +742,8 @@ fn footer_hints(app: &App) -> (&'static str, Vec<Hint>) {
                 nav("hjkl/arrows navigate"),
                 hint("enter details", Enter),
                 hint("m move", Char('m')),
+                // Same width either way, so `g group` stays put.
+                hint(if app.mine_only { "a show all " } else { "a only mine" }, Char('a')),
                 hint("g group", Char('g')),
             ];
             if app.is_grouped() {
@@ -809,6 +874,7 @@ fn draw_help(frame: &mut Frame) {
         key("Enter", "open card details"),
         key("m", "enter MOVE mode for the card"),
         key("c", "create a new card"),
+        key("a", "only my cards (toggle)"),
         key("g", "group: none → epic → assignee"),
         key("h at column 1", "gutter: j/k hop lane headers"),
         key("z / Enter", "fold / unfold a lane"),
