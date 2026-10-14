@@ -12,6 +12,8 @@ mod clipboard;
 mod colors;
 mod config;
 mod create;
+mod edit;
+mod find;
 mod form;
 mod jira;
 mod lanes;
@@ -142,7 +144,13 @@ fn run_event_loop(
                 SyncEvent::CreateMeta(result) => app.on_create_meta(result),
                 SyncEvent::TeamMembers(result) => app.on_team_members(result),
                 SyncEvent::Created(result) => app.on_created(result),
+                SyncEvent::SearchResults { seq, query, result } => app.on_search_results(seq, query, result),
+                SyncEvent::FieldUpdated { key, field, result } => app.on_field_updated(&key, field, result),
             }
+        }
+        let action = app.tick();
+        if dispatch(action, app, worker, board_id, terminal, mouse) {
+            return Ok(Exit::Quit);
         }
 
         terminal.draw(|frame| ui::draw(frame, app))?;
@@ -192,6 +200,8 @@ fn dispatch(
         Action::FetchCreateMeta(project) => worker.send(Command::FetchCreateMeta { project }),
         Action::FetchTeamMembers(team_id) => worker.send(Command::FetchTeamMembers { team_id }),
         Action::CreateIssue(draft) => worker.send(Command::CreateIssue { draft }),
+        Action::Search { seq, project, query } => worker.send(Command::Search { seq, project, query }),
+        Action::UpdateField { key, field, value } => worker.send(Command::UpdateField { key, field, value }),
         Action::EditExternally => {
             if let Some(text) = app.rich_editor_text() {
                 match edit_externally(terminal, mouse, &text) {

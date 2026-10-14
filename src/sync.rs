@@ -12,6 +12,8 @@ use serde_json::Value;
 
 use crate::config::FieldMap;
 use crate::create::{CreateDraft, CreateError, CreateField, CreateMeta};
+use crate::edit::EditField;
+use crate::find;
 use crate::jira::client::{JiraClient, JiraError};
 use crate::jira::mapping;
 use crate::model::{Board, Comment, Issue, RawFields, RichField, SprintRef, Transition};
@@ -35,6 +37,10 @@ pub enum Command {
     /// People who work on a team's issues (for the Assignee picker).
     FetchTeamMembers { team_id: String },
     CreateIssue { draft: CreateDraft },
+    /// Find tickets in `project` (see [`find`]); `seq` comes back with the results.
+    Search { seq: u64, project: String, query: String },
+    /// Set one field (value in Jira's shape); on success the issue is re-fetched.
+    UpdateField { key: String, field: EditField, value: Value },
     Shutdown,
 }
 
@@ -58,6 +64,9 @@ pub enum Event {
     TeamMembers(Result<Vec<(String, String)>, String>),
     /// The new card, fetched back after creating it.
     Created(Result<Issue, CreateError>),
+    SearchResults { seq: u64, query: String, result: Result<Vec<Issue>, String> },
+    /// On success, the issue as Jira now has it.
+    FieldUpdated { key: String, field: EditField, result: Result<Issue, JiraError> },
 }
 
 pub struct Worker {
@@ -194,6 +203,33 @@ fn run(
                     });
                 Event::Created(result)
             }
+            Command::Search { seq, project, query } => {
+                let result = search(&client, &fields, &browse_base, &project, &query).map_err(|e| format!("{e:#}"));
+                Event::SearchResults { seq, query, result }
+            }
+            Command::UpdateField { key, field, value } => {
+                let id = match field {
+                    EditField::Summary => "summary".to_string(),
+                    // Status changes go through transitions; Jira rejects this.
+                    EditField::Status => "status".to_string(),
+                    EditField::Assignee => "assignee".to_string(),
+                    EditField::StoryPoints => fields.story_points.clone(),
+                    EditField::Sprint => fields.sprint.clone(),
+                    EditField::Epic => "parent".to_string(),
+                    EditField::Description => "description".to_string(),
+                    EditField::AcceptanceCriteria => fields.acceptance_criteria.clone(),
+                };
+                let result = client.update_fields(&key, serde_json::json!({ id: value })).and_then(|()| {
+                    client
+                        .issue(&key, &field_list(&fields))
+                        .map(|raw| mapping::map_issue(&raw, &fields, &browse_base))
+                        .map_err(|e| JiraError {
+                            messages: vec![format!("saved, but couldn't load {key} back: {e:#}")],
+                            ..Default::default()
+                        })
+                });
+                Event::FieldUpdated { key, field, result }
+            }
             Command::FetchComments { key } => {
                 let result = client
                     .comments(&key)
@@ -243,6 +279,26 @@ pub fn load_board(
     };
     let project = info.location.project_key;
     Ok(mapping::build_board(config, scope, project, sprints, raw, fields, browse_base))
+}
+
+/// Tickets for the finder: the issue the query names (if it exists), then
+/// Jira's text search.
+fn search(client: &JiraClient, fields: &FieldMap, browse_base: &str, project: &str, query: &str) -> anyhow::Result<Vec<Issue>> {
+    let list = field_list(fields);
+    let mut found = Vec::new();
+    if let Some(key) = find::direct_key(project, query) {
+        if let Some(raw) = client.find_issue(&key, &list)? {
+            found.push(mapping::map_issue(&raw, fields, browse_base));
+        }
+    }
+    if let Some(jql) = find::jql(project, query) {
+        for raw in client.search(&jql, &list, find::MAX_RESULTS as u32)? {
+            if !found.iter().any(|i: &Issue| i.key == raw.key) {
+                found.push(mapping::map_issue(&raw, fields, browse_base));
+            }
+        }
+    }
+    Ok(found)
 }
 
 /// The dialog field a Jira field id belongs to.

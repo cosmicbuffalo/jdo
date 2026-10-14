@@ -146,7 +146,7 @@ pub struct Picker {
 
 impl Picker {
     /// `options[0]` should be the "none" choice; `chosen` indexes `options`.
-    fn new(options: Vec<PickOption>, chosen: usize) -> Self {
+    pub fn new(options: Vec<PickOption>, chosen: usize) -> Self {
         let chosen = options.get(chosen).cloned().unwrap_or_else(|| PickOption::none("None"));
         Self { options, chosen, filter: String::new(), highlight: 0, typed_keys: false, loading: false }
     }
@@ -166,7 +166,12 @@ impl Picker {
         found
     }
 
-    fn choose(&mut self, index: usize) -> bool {
+    /// Index of the option with this key (`None` is the "none" choice).
+    pub fn position(&self, key: Option<&str>) -> Option<usize> {
+        self.options.iter().position(|o| o.key.as_deref() == key)
+    }
+
+    pub fn choose(&mut self, index: usize) -> bool {
         match self.matches().get(index).cloned() {
             Some(option) => {
                 self.chosen = option;
@@ -179,7 +184,7 @@ impl Picker {
     }
 
     /// Returns true when a choice was made.
-    fn handle_key(&mut self, key: KeyEvent) -> bool {
+    pub fn handle_key(&mut self, key: KeyEvent) -> bool {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let count = self.matches().len();
         match key.code {
@@ -201,6 +206,11 @@ impl Picker {
             _ => {}
         }
         false
+    }
+
+    /// Add an option at the end, keeping the order.
+    pub fn push(&mut self, option: PickOption) {
+        self.options.push(option);
     }
 
     /// Add options that arrived later (e.g. the team roster), keeping the
@@ -264,32 +274,18 @@ impl CreateForm {
         teams.extend(counts.into_iter().map(|(t, _)| PickOption::new(t.id, t.name)));
         let team = Picker::new(teams, 1);
 
-        // Active sprint first, then future ones (the board's order).
-        let mut sprints = vec![PickOption::none("No sprint (backlog)")];
-        sprints.extend(board.sprints.iter().map(|s| PickOption {
-            note: s.active.then(|| "(active)".to_string()),
-            ..PickOption::new(s.id.to_string(), s.name.clone())
-        }));
+        let sprints = sprint_options(board);
         let active = board.sprints.iter().position(|s| s.active).map(|i| i + 1).unwrap_or(0);
         let sprint = Picker::new(sprints, active);
 
-        let mut epics = vec![PickOption::none("No epic")];
-        for e in issues().filter_map(|i| i.epic.as_ref()) {
-            if !epics.iter().any(|o| o.key.as_deref() == Some(e.key.as_str())) {
-                epics.push(PickOption { color: e.color, ..PickOption::new(e.key.clone(), e.name.clone()) });
-            }
+        let default_epic = epic.map(|e| e.key.as_str());
+        let mut epic = epic_picker(board);
+        if let Some(i) = default_epic.and_then(|key| epic.position(Some(key))) {
+            epic.chosen = epic.options[i].clone();
         }
-        epics[1..].sort_by_key(|o| o.label.to_lowercase());
-        let chosen = epic.and_then(|e| epics.iter().position(|o| o.key.as_deref() == Some(e.key.as_str()))).unwrap_or(0);
-        let mut epic = Picker::new(epics, chosen);
-        epic.typed_keys = true;
 
         // The board's people now; the team roster is added when it arrives.
-        let mut assignee = Picker::new(vec![PickOption::none("Unassigned")], 0);
-        let people = issues()
-            .filter_map(|i| Some(PickOption::new(i.assignee_id.clone()?, i.assignee.clone()?)))
-            .chain(me.map(|(id, name)| PickOption::new(id.clone(), name.clone())));
-        assignee.extend(people);
+        let mut assignee = assignee_picker(board, me);
         assignee.loading = true;
 
         Self {
@@ -549,8 +545,45 @@ impl CreateForm {
     }
 }
 
+/// "No sprint (backlog)", then the board's active and future sprints in its order.
+pub fn sprint_options(board: &Board) -> Vec<PickOption> {
+    let mut sprints = vec![PickOption::none("No sprint (backlog)")];
+    sprints.extend(board.sprints.iter().map(|s| PickOption {
+        note: s.active.then(|| "(active)".to_string()),
+        ..PickOption::new(s.id.to_string(), s.name.clone())
+    }));
+    sprints
+}
+
+/// The board's epics (and "No epic"); a typed key that isn't listed can be used too.
+pub fn epic_picker(board: &Board) -> Picker {
+    let mut epics = vec![PickOption::none("No epic")];
+    for e in board.columns.iter().flat_map(|c| &c.issues).filter_map(|i| i.epic.as_ref()) {
+        if !epics.iter().any(|o| o.key.as_deref() == Some(e.key.as_str())) {
+            epics.push(PickOption { color: e.color, ..PickOption::new(e.key.clone(), e.name.clone()) });
+        }
+    }
+    epics[1..].sort_by_key(|o| o.label.to_lowercase());
+    let mut picker = Picker::new(epics, 0);
+    picker.typed_keys = true;
+    picker
+}
+
+/// "Unassigned", the board's people and me, by name.
+pub fn assignee_picker(board: &Board, me: Option<&(String, String)>) -> Picker {
+    let mut picker = Picker::new(vec![PickOption::none("Unassigned")], 0);
+    let people = board
+        .columns
+        .iter()
+        .flat_map(|c| &c.issues)
+        .filter_map(|i| Some(PickOption::new(i.assignee_id.clone()?, i.assignee.clone()?)))
+        .chain(me.map(|(id, name)| PickOption::new(id.clone(), name.clone())));
+    picker.extend(people);
+    picker
+}
+
 /// `ABC-123`: letters/digits/underscore, a dash, digits.
-fn looks_like_key(text: &str) -> bool {
+pub fn looks_like_key(text: &str) -> bool {
     let Some((project, number)) = text.split_once('-') else { return false };
     !project.is_empty()
         && project.chars().next().is_some_and(|c| c.is_ascii_alphabetic())

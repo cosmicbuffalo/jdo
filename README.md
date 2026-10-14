@@ -23,8 +23,9 @@ A running `jdo` notices when it is reinstalled and restarts itself into the new 
 - **Cards** — key, summary, epic (in the epic's Jira color), points (`? pts` when unestimated) and a distinct colored assignee pill (red `Unassigned` when nobody owns it).
 - **Grouping** — `g` cycles none → epic → assignee. Each group is a foldable section with a complete board of its own.
 - **Only mine** — `a` on the board shows only cards assigned to you (press again for everyone's); works with grouping and survives a reinstall restart.
+- **Find** — `f` finds any ticket in the board's project, on the board or not: type a key (`1234` or `ABC-1234`) or words from its title, description or comments. Board cards match instantly (fuzzy, on key + title) while Jira's text search fills in as you pause; `↑`/`↓` pick, `Enter` opens it just like a board card, and closing the details returns to the results. An empty query lists the tickets you created, newest first; `●` marks cards already on the board.
 - **Details** — `Enter` opens a card: fields, description, acceptance criteria, comments.
-- **Editing** — in details, `e` / `a` edit the description / acceptance criteria as Markdown (`Ctrl-G` for `$EDITOR`). Headings, lists, code, quotes, links and bold/italic round-trip; tables, mentions and the like are kept as `⟦n:…⟧` placeholders and restored on save.
+- **Editing** — in details, `e` enters edit mode: `j`/`k` walk the editable fields (title, status, assignee, story points, sprint, epic, description, acceptance criteria) and `Enter` changes the one under the cursor — a one-line input, or a type-to-filter list for assignee, sprint and epic. Status lists the statuses the card's workflow can move it to from where it is, like move mode; a transition with a screen opens its form. This works for cards that aren't on the board too. Each change saves to Jira on its own. Putting a ticket in the active sprint puts it on the board; moving a board card out of it takes it off. `a` still jumps straight to the acceptance criteria. Description and acceptance criteria are edited as Markdown (`Ctrl-G` for `$EDITOR`). Headings, lists, code, quotes, links and bold/italic round-trip; tables, mentions and the like are kept as `⟦n:…⟧` placeholders and restored on save.
 - **Move mode** — `m` loads the card's workflow; only columns it can legally move to light up. Transitions with screens open a form pre-filled with the issue's values; Jira's validator errors land on the offending fields.
 - **Create** — `c` opens a "Create new <PROJECT> ticket" dialog: Team and Sprint default to the board's, Epic (the section you're in, when grouped by epic) and Assignee (the team's members) are type-to-filter pickers, plus Title, Description and Acceptance Criteria. Jira's create rules mark required fields; its errors show under the fields they belong to.
 - **Mouse** — click to select, click again to open, `[×]` to close; footer hints and dialog buttons are clickable. `--no-mouse` keeps the terminal's own text selection.
@@ -37,7 +38,9 @@ A running `jdo` notices when it is reinstalled and restarts itself into the new 
 | `Enter` | open card details (on a section header: fold) |
 | `m` | move mode: `h`/`l` reachable columns, `Tab` other transition, `Enter` confirm, `Esc` cancel |
 | `c` | create a card (`Tab` between fields, `Ctrl-S` submit, `Esc` cancel) |
-| `e` / `a` | in details: edit description / acceptance criteria (`Ctrl-S` save) |
+| `f` | find a ticket: type to search, `↑`/`↓` select, `Enter` open, `Esc` close |
+| `e` | in details: edit mode — `j`/`k` field, `Enter` change it, `Esc` done |
+| `a` | in details: edit acceptance criteria (`Ctrl-S` save) |
 | `g` | group: none → epic → assignee |
 | `a` | on the board: show only your cards / everyone's |
 | `z` / `Z` | fold the section / all sections |

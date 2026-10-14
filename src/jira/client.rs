@@ -165,6 +165,32 @@ impl JiraClient {
         Ok(people)
     }
 
+    /// Issues matching `jql`, at most `max` of them (one page).
+    pub fn search(&self, jql: &str, fields: &[&str], max: u32) -> Result<Vec<RawIssue>> {
+        let url = self.url(&format!(
+            "/rest/api/3/search/jql?maxResults={max}&fields={}&jql={}",
+            fields.join(","),
+            encode(jql)
+        ));
+        let page: Value = self.get_json(&url, "search")?;
+        let issues = page.get("issues").cloned().unwrap_or(Value::Array(Vec::new()));
+        serde_json::from_value(issues).context("parse search results")
+    }
+
+    /// One issue, or `None` if there's no such issue (or it isn't visible).
+    pub fn find_issue(&self, key: &str, fields: &[&str]) -> Result<Option<RawIssue>> {
+        let url = self.url(&format!("/rest/api/3/issue/{}?fields={}", encode(key), fields.join(",")));
+        let resp = self.auth.apply(self.http.get(&url)).send().with_context(|| format!("GET {url}"))?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            let status = resp.status();
+            bail!("issue failed: HTTP {status} — {}", truncate(&resp.text().unwrap_or_default(), 300));
+        }
+        Ok(Some(resp.json().context("parse issue")?))
+    }
+
     /// Create an issue; returns its key.
     pub fn create_issue(&self, fields: Value) -> std::result::Result<String, JiraError> {
         let url = self.url("/rest/api/3/issue");

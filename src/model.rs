@@ -102,6 +102,8 @@ pub struct Issue {
     pub acceptance_criteria: String,
     pub story_points: Option<f64>,
     pub sprint: Option<String>,
+    /// The sprint `sprint` names (the active one when the issue has several).
+    pub sprint_id: Option<u64>,
     pub team: Option<TeamRef>,
     pub epic: Option<EpicRef>,
     /// Browser URL for the issue (used by copy-to-clipboard).

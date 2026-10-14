@@ -14,6 +14,8 @@ use serde_json::Value;
 
 use crate::colors::UserColors;
 use crate::create::{CreateDraft, CreateError, CreateField, CreateForm, CreateMeta, CreateOutcome};
+use crate::edit::{EditField, EditOutcome, FieldEditor};
+use crate::find::{FindOutcome, Finder};
 use crate::form::{FormOutcome, TransitionForm, needs_form};
 use crate::jira::adf;
 use crate::jira::markdown::{self, Markdown};
@@ -39,6 +41,9 @@ pub enum Action {
     FetchCreateMeta(String),
     FetchTeamMembers(String),
     CreateIssue(CreateDraft),
+    /// Ask Jira for tickets matching `query` in `project`.
+    Search { seq: u64, project: String, query: String },
+    UpdateField { key: String, field: EditField, value: Value },
 }
 
 pub enum Mode {
@@ -49,6 +54,10 @@ pub enum Mode {
     TransitionForm(Box<TransitionForm>, PendingMove),
     EditRich(Box<RichEditor>),
     Create(Box<CreateForm>),
+    /// Finding a ticket anywhere in the project (`f`).
+    Find(Box<Finder>),
+    /// Walking a card's fields to change them (`e` in details).
+    EditFields(Box<FieldEditor>),
 }
 
 /// Editing a description or acceptance criteria as Markdown.
@@ -64,6 +73,8 @@ pub struct RichEditor {
     pub error: Option<String>,
     /// Details scroll to return to.
     pub details_scroll: u16,
+    /// Opened from edit mode (its cursor), which it returns to.
+    pub edit_cursor: Option<usize>,
 }
 
 /// A card's rich-text fields as ADF, fetched when its details open.
@@ -91,6 +102,8 @@ pub struct PendingMove {
     pub origin_row: usize,
     pub old_status: String,
     pub old_status_id: String,
+    /// Started from edit mode (its cursor and scroll), which it returns to.
+    pub from_edit: Option<(usize, u16)>,
 }
 
 /// A column the card may move to, with the transitions that land there.
@@ -122,6 +135,8 @@ pub enum HitTarget {
     Key(KeyEvent),
     /// Something in the create dialog.
     Create(CreateHit),
+    /// Row `n` of the finder's results.
+    FindResult(usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -215,6 +230,10 @@ pub struct App {
     pub status: Option<(String, StatusLevel)>,
     pub comments: HashMap<String, CommentsState>,
     pub rich: HashMap<String, RichState>,
+    /// Cards opened from the finder that aren't on the board.
+    pub loose: HashMap<String, Issue>,
+    /// The finder to go back to when the details it opened close.
+    find_return: Option<Box<Finder>>,
     /// `(accountId, displayName)` of the signed-in user.
     pub me: Option<(String, String)>,
     /// Moves submitted without a form, awaiting Jira's verdict.
@@ -251,6 +270,8 @@ impl App {
             status: None,
             comments: HashMap::new(),
             rich: HashMap::new(),
+            loose: HashMap::new(),
+            find_return: None,
             me: None,
             in_flight: HashMap::new(),
             deferred_board: None,
@@ -264,7 +285,20 @@ impl App {
 
     /// Any spinner on screen, so the loop redraws fast enough to animate it.
     pub fn is_animating(&self) -> bool {
-        self.is_loading() || self.refreshing
+        self.is_loading()
+            || self.refreshing
+            || matches!(&self.mode, Mode::Find(f) if f.is_busy())
+            || matches!(&self.mode, Mode::EditFields(e) if e.saving.is_some())
+    }
+
+    /// Time-driven work, run every pass of the event loop: the finder's
+    /// search once typing pauses.
+    pub fn tick(&mut self) -> Action {
+        let Mode::Find(finder) = &mut self.mode else { return Action::None };
+        match finder.due(Instant::now()) {
+            Some((seq, query)) => Action::Search { seq, project: self.board.project_key.clone(), query },
+            None => Action::None,
+        }
     }
 
     pub fn spinner(&self) -> &'static str {
@@ -284,6 +318,23 @@ impl App {
 
     pub fn current_column(&self) -> Option<&Column> {
         self.board.columns.get(self.selected_column)
+    }
+
+    /// A card by key: on the board, or opened from the finder.
+    pub fn issue(&self, key: &str) -> Option<&Issue> {
+        lookup(&self.board, &self.loose, key)
+    }
+
+    fn issue_mut(&mut self, key: &str) -> Option<&mut Issue> {
+        match self.board.find(key) {
+            Some((c, r)) => Some(&mut self.board.columns[c].issues[r]),
+            None => self.loose.get_mut(key),
+        }
+    }
+
+    /// Every card on the board, for the finder's instant matches.
+    fn board_issues(&self) -> Vec<&Issue> {
+        self.board.columns.iter().flat_map(|c| &c.issues).collect()
     }
 
     pub fn selected_issue(&self) -> Option<&Issue> {
@@ -634,6 +685,8 @@ impl App {
             .collect();
         self.user_colors.assign(assignees.iter().map(String::as_str));
         self.load_error = None;
+        let board = &self.board;
+        self.loose.retain(|key, _| board.find(key).is_none());
         // Re-apply moves Jira hasn't confirmed yet so cards don't jump back.
         for pending in self.in_flight.values() {
             if let Some(issue) = self.board.issue_mut(&pending.key) {
@@ -666,6 +719,15 @@ impl App {
     }
 
     pub fn on_transitions(&mut self, key: &str, result: Result<(Vec<Transition>, RawFields), String>) {
+        if let Mode::EditFields(editor) = &mut self.mode {
+            if let (true, Some(issue)) = (editor.key == key, lookup(&self.board, &self.loose, key)) {
+                editor.on_transitions(issue, result);
+                if let Some(error) = editor.error.clone() {
+                    self.error(format!("{key}: {error}"));
+                }
+            }
+            return;
+        }
         let Mode::Moving(state) = &self.mode else { return };
         if state.pending.key != key {
             return;
@@ -725,8 +787,14 @@ impl App {
                 match result {
                     Ok(()) => {
                         let status = form.to_status.clone();
-                        self.in_flight.insert(key.to_string(), pending.clone());
-                        self.mode = Mode::Board;
+                        match pending.from_edit {
+                            // Edit mode waits for the refreshed card.
+                            Some((cursor, scroll)) => self.mode = Mode::EditFields(Box::new(edit_status_saving(key, cursor, scroll))),
+                            None => {
+                                self.in_flight.insert(key.to_string(), pending.clone());
+                                self.mode = Mode::Board;
+                            }
+                        }
                         self.settle();
                         self.info(format!("{key} → {status}"));
                     }
@@ -734,6 +802,19 @@ impl App {
                         form.apply_error(&err);
                         self.error(format!("{key}: {err}"));
                     }
+                }
+                return;
+            }
+        }
+
+        // A status change from edit mode without a form.
+        if let Mode::EditFields(editor) = &mut self.mode {
+            if editor.key == key && editor.saving == Some(EditField::Status) {
+                // On success the worker follows up with `IssueRefreshed`.
+                if let Err(err) = result {
+                    editor.saving = None;
+                    editor.error = Some(err.to_string());
+                    self.error(format!("{key}: status change rejected — {err}"));
                 }
                 return;
             }
@@ -751,8 +832,31 @@ impl App {
         }
     }
 
-    /// The authoritative issue after a successful transition.
-    pub fn on_issue_refreshed(&mut self, mut issue: Issue) {
+    /// The authoritative issue after a successful transition (or create).
+    pub fn on_issue_refreshed(&mut self, issue: Issue) {
+        let key = issue.key.clone();
+        let editing = match &mut self.mode {
+            Mode::EditFields(editor) if editor.key == key => Some(editor),
+            _ => None,
+        };
+        // Changed from edit mode, or off the board: it may join or leave the board.
+        if editing.is_some() || self.loose.contains_key(&key) {
+            if let Some(editor) = editing {
+                editor.saving = None;
+            }
+            let status = issue.status.clone();
+            match self.apply_issue(issue) {
+                Placement::Joined => self.info(format!("{key} → {status} — it's on the board now")),
+                Placement::Left => self.info(format!("{key} → {status} — it's no longer on this board")),
+                Placement::Stayed => self.info(format!("{key} → {status}")),
+            }
+            return;
+        }
+        self.place_refreshed(issue);
+    }
+
+    /// Put a refreshed issue in the column its status maps to.
+    fn place_refreshed(&mut self, mut issue: Issue) {
         let key = issue.key.clone();
         if let Some(name) = &issue.assignee {
             self.user_colors.assign([name.as_str()]);
@@ -818,7 +922,8 @@ impl App {
         match result {
             Ok(value) => {
                 let text = adf::to_text(Some(&value));
-                if let Some(issue) = self.board.issue_mut(key) {
+                let (scroll, edit_cursor) = (editor.details_scroll, editor.edit_cursor);
+                if let Some(issue) = self.issue_mut(key) {
                     match field {
                         RichField::Description => issue.description = text,
                         RichField::AcceptanceCriteria => issue.acceptance_criteria = text,
@@ -830,8 +935,7 @@ impl App {
                         RichField::AcceptanceCriteria => *acceptance = value,
                     }
                 }
-                let scroll = editor.details_scroll;
-                self.mode = Mode::Details { key: key.to_string(), scroll };
+                self.leave_rich(key.to_string(), scroll, edit_cursor);
                 self.info(format!("{key}: saved {}", field.label().to_lowercase()));
             }
             Err(err) => {
@@ -898,7 +1002,8 @@ impl App {
 
         // `?` opens the keymap from anywhere except while typing in a form field.
         let typing = matches!(&self.mode, Mode::TransitionForm(form, _) if form.editor.is_some())
-            || matches!(self.mode, Mode::EditRich(_) | Mode::Create(_));
+            || matches!(&self.mode, Mode::EditFields(editor) if editor.active.is_some())
+            || matches!(self.mode, Mode::EditRich(_) | Mode::Create(_) | Mode::Find(_));
         if key.code == KeyCode::Char('?') && !typing {
             let previous = std::mem::replace(&mut self.mode, Mode::Board);
             self.mode = match previous {
@@ -916,6 +1021,8 @@ impl App {
             Mode::TransitionForm(..) => self.handle_form_key(key),
             Mode::EditRich(_) => self.handle_rich_key(key),
             Mode::Create(_) => self.handle_create_key(key),
+            Mode::Find(_) => self.handle_find_key(key),
+            Mode::EditFields(_) => self.handle_edit_key(key),
         };
         self.settle();
         action
@@ -1007,10 +1114,21 @@ impl App {
             HitTarget::Key(key) => self.handle_key(key),
             HitTarget::CloseDetails => {
                 if matches!(self.mode, Mode::Details { .. }) {
-                    self.mode = Mode::Board;
+                    self.close_details();
                     self.settle();
                 }
                 Action::None
+            }
+            HitTarget::FindResult(index) => {
+                let Mode::Find(finder) = &mut self.mode else { return Action::None };
+                if finder.highlight != index {
+                    finder.highlight = index;
+                    return Action::None;
+                }
+                match finder.results.get(index).cloned() {
+                    Some(issue) => self.open_found(issue),
+                    None => Action::None,
+                }
             }
             // Board clicks only count when no modal covers the board.
             HitTarget::Card { column, row } if matches!(self.mode, Mode::Board) => {
@@ -1057,7 +1175,7 @@ impl App {
                 *scroll = if down { scroll.saturating_add(3) } else { scroll.saturating_sub(3) };
                 Action::None
             }
-            Mode::Board => self.handle_key(KeyEvent::from(if down { KeyCode::Down } else { KeyCode::Up })),
+            Mode::Board | Mode::Find(_) => self.handle_key(KeyEvent::from(if down { KeyCode::Down } else { KeyCode::Up })),
             _ => Action::None,
         }
     }
@@ -1140,9 +1258,237 @@ impl App {
             KeyCode::Enter => return self.open_details(),
             KeyCode::Char('m') => return self.begin_move(),
             KeyCode::Char('c') => return self.begin_create(),
+            KeyCode::Char('f') => {
+                let mut finder = Finder::new();
+                finder.rerank(&self.board_issues());
+                self.mode = Mode::Find(Box::new(finder));
+            }
             _ => {}
         }
         Action::None
+    }
+
+    // ----- finding a ticket --------------------------------------------------
+
+    fn handle_find_key(&mut self, key: KeyEvent) -> Action {
+        let board: Vec<&Issue> = self.board.columns.iter().flat_map(|c| &c.issues).collect();
+        let Mode::Find(finder) = &mut self.mode else { return Action::None };
+        match finder.handle_key(key, &board) {
+            FindOutcome::None => Action::None,
+            FindOutcome::Close => {
+                self.mode = Mode::Board;
+                Action::None
+            }
+            FindOutcome::Open(issue) => self.open_found(issue),
+        }
+    }
+
+    pub fn on_search_results(&mut self, seq: u64, query: String, result: Result<Vec<Issue>, String>) {
+        let mut result = result;
+        if let Ok(found) = &mut result {
+            for issue in found.iter_mut() {
+                self.fill_epic(issue);
+            }
+            self.user_colors.assign(found.iter().filter_map(|i| i.assignee.as_deref()));
+        }
+        let board: Vec<&Issue> = self.board.columns.iter().flat_map(|c| &c.issues).collect();
+        let finder = match &mut self.mode {
+            Mode::Find(finder) => finder,
+            _ => match &mut self.find_return {
+                Some(finder) => finder,
+                None => return,
+            },
+        };
+        finder.on_results(seq, query, result, &board);
+    }
+
+    /// Open a finder result's details; closing them comes back to the finder.
+    fn open_found(&mut self, issue: Issue) -> Action {
+        let Mode::Find(finder) = std::mem::replace(&mut self.mode, Mode::Board) else { return Action::None };
+        let key = issue.key.clone();
+        if self.board.find(&key).is_some() {
+            // On the board: select it there too (unless the filter hides it).
+            self.select_key(&key);
+        } else {
+            self.loose.insert(key.clone(), issue);
+        }
+        self.find_return = Some(finder);
+        self.open_details_for(key)
+    }
+
+    /// Leave the details view: back to the finder that opened them, else the board.
+    fn close_details(&mut self) {
+        self.mode = match self.find_return.take() {
+            Some(mut finder) => {
+                for key in finder.results.iter().map(|i| i.key.clone()).collect::<Vec<_>>() {
+                    if let Some(issue) = self.issue(&key) {
+                        finder.update(issue);
+                    }
+                }
+                Mode::Find(finder)
+            }
+            None => Mode::Board,
+        };
+    }
+
+    /// Give an issue from the Platform API (which only knows its epic's key)
+    /// the epic's name and color from the board, when the board has them.
+    fn fill_epic(&self, issue: &mut Issue) {
+        let Some(epic) = issue.epic.as_mut() else { return };
+        if epic.color.is_some() {
+            return;
+        }
+        if let Some(known) = self
+            .board
+            .columns
+            .iter()
+            .flat_map(|c| &c.issues)
+            .filter_map(|i| i.epic.as_ref())
+            .find(|e| e.key == epic.key)
+        {
+            epic.color = known.color;
+            epic.name = known.name.clone();
+        }
+    }
+
+    // ----- editing fields ----------------------------------------------------
+
+    fn handle_edit_key(&mut self, key: KeyEvent) -> Action {
+        let Mode::EditFields(editor) = &mut self.mode else { return Action::None };
+        let Some(issue) = lookup(&self.board, &self.loose, &editor.key) else {
+            let (key, scroll) = (editor.key.clone(), editor.scroll);
+            self.mode = Mode::Details { key, scroll };
+            return Action::None;
+        };
+        match editor.handle_key(key, issue, &self.board, self.me.as_ref()) {
+            EditOutcome::None => {
+                if let Some(error) = editor.error.clone() {
+                    self.error(error);
+                }
+                Action::None
+            }
+            EditOutcome::Done => {
+                let (key, scroll) = (editor.key.clone(), editor.scroll);
+                self.mode = Mode::Details { key, scroll };
+                Action::None
+            }
+            EditOutcome::Rich(field) => {
+                let (key, scroll, cursor) = (editor.key.clone(), editor.scroll, editor.cursor);
+                self.begin_rich_edit(key, scroll, field, Some(cursor));
+                Action::None
+            }
+            EditOutcome::FetchTransitions => {
+                let key = editor.key.clone();
+                self.info(format!("loading workflow for {key}…"));
+                Action::FetchTransitions(key)
+            }
+            EditOutcome::Transition(transition, current) => {
+                let (key, cursor, scroll) = (editor.key.clone(), editor.cursor, editor.scroll);
+                let pending = PendingMove {
+                    key: key.clone(),
+                    origin_column: self.board.find(&key).map_or(0, |(c, _)| c),
+                    origin_row: self.board.find(&key).map_or(0, |(_, r)| r),
+                    old_status: issue.status.clone(),
+                    old_status_id: issue.status_id.clone(),
+                    from_edit: Some((cursor, scroll)),
+                };
+                if needs_form(&transition) {
+                    let form = TransitionForm::new(&key, &transition, &current, self.me.as_ref());
+                    self.info(format!("{key}: {} — fill in the fields, then Submit", transition.name));
+                    self.mode = Mode::TransitionForm(Box::new(form), pending);
+                    return Action::None;
+                }
+                editor.saving = Some(EditField::Status);
+                self.info(format!("{key} → {}…", transition.to_status_name));
+                Action::SubmitTransition { key, body: serde_json::json!({ "transition": { "id": transition.id } }) }
+            }
+            EditOutcome::Save(field, value) => {
+                let key = editor.key.clone();
+                self.info(format!("{key}: saving {}…", field.label().to_lowercase()));
+                Action::UpdateField { key, field, value }
+            }
+        }
+    }
+
+    pub fn on_field_updated(&mut self, key: &str, field: EditField, result: Result<Issue, JiraError>) {
+        let editing = match &mut self.mode {
+            Mode::EditFields(editor) if editor.key == key => Some(editor),
+            _ => None,
+        };
+        match result {
+            Ok(issue) => {
+                if let Some(editor) = editing {
+                    editor.saving = None;
+                    editor.error = None;
+                }
+                let label = field.label().to_lowercase();
+                match self.apply_issue(issue) {
+                    Placement::Joined => self.info(format!("{key}: saved {label} — it's on the board now")),
+                    Placement::Left => self.info(format!("{key}: saved {label} — it's no longer on this board")),
+                    Placement::Stayed => self.info(format!("{key}: saved {label}")),
+                }
+            }
+            Err(err) => {
+                if let Some(editor) = editing {
+                    editor.saving = None;
+                    editor.error = Some(err.to_string());
+                }
+                self.error(format!("{key}: couldn't save {} — {err}", field.label().to_lowercase()));
+            }
+        }
+    }
+
+    /// Take Jira's latest copy of an issue, putting it on or off the board
+    /// when its sprint changed whether the board shows it.
+    fn apply_issue(&mut self, mut issue: Issue) -> Placement {
+        let key = issue.key.clone();
+        // Keep the epic's name and color, which the Platform API doesn't send.
+        if let (Some(new), Some(old)) = (issue.epic.as_mut(), self.issue(&key).and_then(|i| i.epic.as_ref())) {
+            if new.key == old.key && new.color.is_none() {
+                new.color = old.color;
+                new.name = old.name.clone();
+            }
+        }
+        self.fill_epic(&mut issue);
+        if let Some(finder) = &mut self.find_return {
+            finder.update(&issue);
+        }
+        let on_board = self.board.find(&key).is_some();
+        // Scrum boards show the active sprint; kanban boards keep what they have.
+        let shown = if self.board.sprints.is_empty() {
+            on_board
+        } else {
+            issue.sprint_id.is_some_and(|id| self.board.sprints.iter().any(|s| s.id == id && s.active))
+                && self.board.column_for_status(&issue.status_id).is_some()
+        };
+        match (on_board, shown) {
+            (true, true) => {
+                self.place_refreshed(issue);
+                Placement::Stayed
+            }
+            (false, true) => {
+                self.loose.remove(&key);
+                self.place_refreshed(issue);
+                self.select_key(&key);
+                Placement::Joined
+            }
+            (true, false) => {
+                let was_selected = self.selected_issue().is_some_and(|i| i.key == key);
+                if let Some((c, r)) = self.board.find(&key) {
+                    self.board.columns[c].issues.remove(r);
+                }
+                self.loose.insert(key, issue);
+                if was_selected {
+                    self.clamp_selection();
+                    self.ensure_focus();
+                }
+                Placement::Left
+            }
+            (false, false) => {
+                self.loose.insert(key, issue);
+                Placement::Stayed
+            }
+        }
     }
 
     // ----- creating a card --------------------------------------------------
@@ -1272,6 +1618,10 @@ impl App {
     fn open_details(&mut self) -> Action {
         let Some(issue) = self.selected_issue() else { return Action::None };
         let key = issue.key.clone();
+        self.open_details_for(key)
+    }
+
+    fn open_details_for(&mut self, key: String) -> Action {
         self.mode = Mode::Details { key: key.clone(), scroll: 0 };
         // Always refetch: comments and text may have changed since last time.
         self.comments.insert(key.clone(), CommentsState::Loading);
@@ -1282,10 +1632,10 @@ impl App {
     }
 
     fn handle_details_key(&mut self, key: KeyEvent) -> Action {
-        let Mode::Details { scroll, .. } = &mut self.mode else { return Action::None };
+        let Mode::Details { key: card, scroll } = &mut self.mode else { return Action::None };
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => self.mode = Mode::Board,
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => self.close_details(),
             KeyCode::Char('d') if ctrl => *scroll = scroll.saturating_add(10),
             KeyCode::Char('u') if ctrl => *scroll = scroll.saturating_sub(10),
             KeyCode::Char('j') | KeyCode::Down => *scroll = scroll.saturating_add(1),
@@ -1295,19 +1645,45 @@ impl App {
             KeyCode::Char('g') | KeyCode::Home => *scroll = 0,
             KeyCode::Char('G') | KeyCode::End => *scroll = u16::MAX,
             KeyCode::Char('m') => {
+                let card = card.clone();
+                if self.board.find(&card).is_none() {
+                    self.info(format!("{card} isn't on this board — only board cards can be moved here"));
+                    return Action::None;
+                }
+                if !self.select_key(&card) {
+                    self.info(format!("{card} is hidden by the only-mine filter — press a on the board to show it"));
+                    return Action::None;
+                }
+                self.find_return = None;
                 self.mode = Mode::Board;
                 return self.begin_move();
             }
-            KeyCode::Char('e') => self.begin_rich_edit(RichField::Description),
-            KeyCode::Char('a') => self.begin_rich_edit(RichField::AcceptanceCriteria),
+            KeyCode::Char('e') => {
+                let editor = FieldEditor::new(card, *scroll);
+                self.mode = Mode::EditFields(Box::new(editor));
+            }
+            KeyCode::Char('a') => {
+                let (card, scroll) = (card.clone(), *scroll);
+                self.begin_rich_edit(card, scroll, RichField::AcceptanceCriteria, None);
+            }
             _ => {}
         }
         Action::None
     }
 
-    fn begin_rich_edit(&mut self, field: RichField) {
-        let Mode::Details { key, scroll } = &self.mode else { return };
-        let (key, scroll) = (key.clone(), *scroll);
+    /// Back from the Markdown editor: to edit mode if it was opened from there.
+    fn leave_rich(&mut self, key: String, scroll: u16, edit_cursor: Option<usize>) {
+        self.mode = match edit_cursor {
+            Some(cursor) => {
+                let mut editor = FieldEditor::new(&key, scroll);
+                editor.cursor = cursor;
+                Mode::EditFields(Box::new(editor))
+            }
+            None => Mode::Details { key, scroll },
+        };
+    }
+
+    fn begin_rich_edit(&mut self, key: String, scroll: u16, field: RichField, edit_cursor: Option<usize>) {
         let value = match self.rich.get(&key) {
             Some(RichState::Loaded { .. }) => self.rich[&key].get(field).cloned().unwrap_or(Value::Null),
             Some(RichState::Failed(message)) => {
@@ -1325,6 +1701,7 @@ impl App {
             saving: false,
             error: None,
             details_scroll: scroll,
+            edit_cursor,
         }));
     }
 
@@ -1336,16 +1713,16 @@ impl App {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Esc => {
-                let (key, scroll) = (editor.key.clone(), editor.details_scroll);
-                self.mode = Mode::Details { key, scroll };
+                let (key, scroll, cursor) = (editor.key.clone(), editor.details_scroll, editor.edit_cursor);
+                self.leave_rich(key, scroll, cursor);
                 self.info("edit cancelled");
             }
             KeyCode::Char('g') if ctrl => return Action::EditExternally,
             KeyCode::Char('s') if ctrl => {
                 let text = editor.editor.lines().join("\n");
                 if text == editor.original {
-                    let (key, scroll) = (editor.key.clone(), editor.details_scroll);
-                    self.mode = Mode::Details { key, scroll };
+                    let (key, scroll, cursor) = (editor.key.clone(), editor.details_scroll, editor.edit_cursor);
+                    self.leave_rich(key, scroll, cursor);
                     self.info("no changes");
                     return Action::None;
                 }
@@ -1373,6 +1750,7 @@ impl App {
             origin_row: self.selected_row,
             old_status: issue.status.clone(),
             old_status_id: issue.status_id.clone(),
+            from_edit: None,
         };
         let key = pending.key.clone();
         self.mode = Mode::Moving(MoveState {
@@ -1503,6 +1881,13 @@ impl App {
             FormOutcome::Cancel => {
                 if let Mode::TransitionForm(_, pending) = std::mem::replace(&mut self.mode, Mode::Board) {
                     self.revert(&pending, SyncState::Synced);
+                    if let Some((cursor, scroll)) = pending.from_edit {
+                        let mut editor = FieldEditor::new(&pending.key, scroll);
+                        editor.cursor = cursor;
+                        self.mode = Mode::EditFields(Box::new(editor));
+                        self.info("status change cancelled");
+                        return Action::None;
+                    }
                 }
                 self.info("move cancelled");
                 Action::None
@@ -1520,6 +1905,25 @@ impl App {
             }
         }
     }
+}
+
+/// Edit mode on the Status field, waiting for Jira's copy after a transition.
+fn edit_status_saving(key: &str, cursor: usize, scroll: u16) -> FieldEditor {
+    let mut editor = FieldEditor::new(key, scroll);
+    editor.cursor = cursor;
+    editor.saving = Some(EditField::Status);
+    editor
+}
+
+/// Where an updated issue ended up relative to the board.
+enum Placement {
+    Stayed,
+    Joined,
+    Left,
+}
+
+fn lookup<'a>(board: &'a Board, loose: &'a HashMap<String, Issue>, key: &str) -> Option<&'a Issue> {
+    board.issue(key).or_else(|| loose.get(key))
 }
 
 /// A text area holding `text`, cursor at the start.
@@ -1614,11 +2018,20 @@ mod tests {
         app.on_rich("A-1", Ok((doc, Value::Null)));
     }
 
+    /// `e` for edit mode, down to Description, Enter.
+    fn edit_description(app: &mut App) {
+        press(app, 'e');
+        for _ in 0..6 {
+            press(app, 'j');
+        }
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+    }
+
     #[test]
     fn editing_a_description_saves_markdown_as_adf() {
         let mut app = app();
         open_with_description(&mut app);
-        press(&mut app, 'e');
+        edit_description(&mut app);
         let Mode::EditRich(editor) = &mut app.mode else { panic!("editor should open") };
         assert_eq!(editor.original, "Old text");
         editor.editor = new_text_area("New **bold** text");
@@ -1628,7 +2041,8 @@ mod tests {
         assert_eq!(value["content"][0]["content"][1]["marks"][0]["type"], "strong");
 
         app.on_rich_updated("A-1", RichField::Description, Ok(value));
-        assert!(matches!(app.mode, Mode::Details { .. }));
+        let Mode::EditFields(editor) = &app.mode else { panic!("back to edit mode") };
+        assert_eq!(editor.field(), EditField::Description, "on the field just edited");
         assert_eq!(app.board.issue("A-1").unwrap().description, "New bold text");
     }
 
@@ -1636,12 +2050,12 @@ mod tests {
     fn unchanged_text_does_not_save_and_errors_keep_the_editor_open() {
         let mut app = app();
         open_with_description(&mut app);
-        press(&mut app, 'e');
+        press(&mut app, 'a'); // straight to acceptance criteria
         let none = app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
         assert!(matches!(none, Action::None));
         assert!(matches!(app.mode, Mode::Details { .. }), "no changes closes without a request");
 
-        press(&mut app, 'e');
+        edit_description(&mut app);
         if let Mode::EditRich(editor) = &mut app.mode {
             editor.editor = new_text_area("changed");
         }
@@ -1659,7 +2073,7 @@ mod tests {
     fn typing_a_question_mark_in_the_editor_does_not_open_help() {
         let mut app = app();
         open_with_description(&mut app);
-        press(&mut app, 'e');
+        edit_description(&mut app);
         press(&mut app, '?');
         assert!(matches!(app.mode, Mode::EditRich(_)));
     }
@@ -1834,6 +2248,204 @@ mod tests {
         press(&mut app, 'h'); // header A
         assert!(matches!(app.handle_key(KeyEvent::from(KeyCode::Char('m'))), Action::None));
         assert!(matches!(app.mode, Mode::Board));
+    }
+
+    /// A scrum board (sprint 11 active) whose first column holds status "1".
+    fn sprint_app() -> App {
+        let mut app = app();
+        app.board.project_key = "P".into();
+        app.board.columns[0].status_ids = vec!["1".into()];
+        app.board.sprints = vec![crate::model::SprintRef { id: 11, name: "Sprint 11".into(), active: true }];
+        app
+    }
+
+    fn backlog_ticket() -> Issue {
+        Issue { key: "P-77".into(), summary: "Ticket I just created".into(), status_id: "1".into(), ..Default::default() }
+    }
+
+    fn find_and_open(app: &mut App, issue: Issue) {
+        press(app, 'f');
+        let Action::Search { seq, project, query } = app.tick() else { panic!("opening searches") };
+        assert_eq!((project.as_str(), query.as_str()), ("P", ""), "empty query: my recent tickets");
+        app.on_search_results(seq, query, Ok(vec![issue]));
+        let action = app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(action, Action::FetchDetails(ref k) if k == "P-77"));
+    }
+
+    #[test]
+    fn a_found_ticket_can_be_added_to_the_active_sprint_and_lands_on_the_board() {
+        let mut app = sprint_app();
+        find_and_open(&mut app, backlog_ticket());
+        assert!(matches!(&app.mode, Mode::Details { key, .. } if key == "P-77"));
+        assert!(app.board.find("P-77").is_none() && app.issue("P-77").is_some(), "kept off the board");
+
+        press(&mut app, 'e');
+        for _ in 0..4 {
+            press(&mut app, 'j'); // Title → Status → Assignee → Story Points → Sprint
+        }
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        app.handle_key(KeyEvent::from(KeyCode::Down)); // Sprint 11
+        let action = app.handle_key(KeyEvent::from(KeyCode::Enter));
+        let Action::UpdateField { key, field, value } = action else { panic!("should save") };
+        assert_eq!((key.as_str(), field, value), ("P-77", EditField::Sprint, serde_json::json!(11)));
+
+        let saved = Issue { sprint_id: Some(11), sprint: Some("Sprint 11".into()), ..backlog_ticket() };
+        app.on_field_updated("P-77", EditField::Sprint, Ok(saved));
+        assert_eq!(app.board.find("P-77"), Some((0, 0)), "now on the board");
+        assert!(app.loose.is_empty());
+        assert_eq!(selected(&app).as_deref(), Some("P-77"));
+        let Mode::EditFields(editor) = &app.mode else { panic!("stays in edit mode") };
+        assert!(editor.saving.is_none());
+
+        press(&mut app, 'q'); // edit mode → details
+        app.handle_key(KeyEvent::from(KeyCode::Esc)); // details → the finder it came from
+        let Mode::Find(finder) = &app.mode else { panic!("back to the finder") };
+        assert_eq!(finder.results[0].sprint.as_deref(), Some("Sprint 11"), "results show the change");
+        app.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert!(matches!(app.mode, Mode::Board));
+    }
+
+    #[test]
+    fn moving_a_card_to_the_backlog_takes_it_off_the_board_but_keeps_its_details() {
+        let mut app = sprint_app();
+        app.board.issue_mut("A-1").unwrap().sprint_id = Some(11);
+        app.handle_key(KeyEvent::from(KeyCode::Enter)); // A-1 details
+        press(&mut app, 'e');
+        let backlog = Issue { key: "A-1".into(), status_id: "1".into(), ..Default::default() };
+        app.on_field_updated("A-1", EditField::Sprint, Ok(backlog));
+        assert!(app.board.find("A-1").is_none());
+        assert!(app.issue("A-1").is_some(), "the open details still have it");
+        assert!(matches!(app.mode, Mode::EditFields(_)));
+    }
+
+    #[test]
+    fn a_rejected_save_keeps_edit_mode_open_with_the_error() {
+        let mut app = sprint_app();
+        find_and_open(&mut app, backlog_ticket());
+        press(&mut app, 'e');
+        let mut err = JiraError::default();
+        err.field_errors.insert("customfield_10020".into(), "Sprint is closed".into());
+        if let Mode::EditFields(editor) = &mut app.mode {
+            editor.saving = Some(EditField::Sprint);
+        }
+        app.on_field_updated("P-77", EditField::Sprint, Err(err));
+        let Mode::EditFields(editor) = &app.mode else { panic!() };
+        assert!(editor.saving.is_none());
+        assert!(editor.error.as_deref().unwrap().contains("Sprint is closed"));
+        assert!(app.board.find("P-77").is_none());
+    }
+
+    fn transition(id: &str, to: &str, fields: Vec<crate::model::ScreenField>) -> Transition {
+        Transition { id: id.into(), name: format!("To {to}"), to_status_id: to.into(), to_status_name: format!("Status {to}"), fields }
+    }
+
+    /// Edit mode on Status with the workflow loaded: "1" → "2" (no screen) or "3" (required field).
+    fn status_picker(app: &mut App, key: &str) {
+        press(app, 'e');
+        press(app, 'j'); // Status
+        load_workflow(app, key);
+    }
+
+    /// Enter on Status, then the workflow arrives.
+    fn load_workflow(app: &mut App, key: &str) {
+        let action = app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(action, Action::FetchTransitions(ref k) if k == key));
+        let required = crate::model::ScreenField {
+            id: "resolution".into(),
+            name: "Resolution".into(),
+            required: true,
+            schema_type: "string".into(),
+            schema_items: None,
+            system: None,
+            custom: None,
+            allowed: Vec::new(),
+        };
+        let workflow = vec![transition("t-loop", "1", vec![]), transition("t2", "2", vec![]), transition("t3", "3", vec![required])];
+        app.on_transitions(key, Ok((workflow, serde_json::json!({}))));
+    }
+
+    #[test]
+    fn edit_mode_changes_status_through_the_workflow() {
+        let mut app = sprint_app();
+        app.board.columns[1].status_ids = vec!["2".into()];
+        app.board.issue_mut("A-1").unwrap().status_id = "1".into();
+        app.board.issue_mut("A-1").unwrap().sprint_id = Some(11);
+        app.handle_key(KeyEvent::from(KeyCode::Enter)); // A-1 details
+        status_picker(&mut app, "A-1");
+        let Mode::EditFields(editor) = &app.mode else { panic!() };
+        let Some(crate::edit::Active::Status(Some(workflow))) = &editor.active else { panic!("workflow picker open") };
+        assert_eq!(workflow.picker.matches().len(), 3, "current + two targets; the loop is left out");
+
+        let action = app.handle_key(KeyEvent::from(KeyCode::Enter)); // Status 2: no screen
+        let Action::SubmitTransition { key, body } = action else { panic!("submits") };
+        assert_eq!((key.as_str(), &body["transition"]["id"]), ("A-1", &serde_json::json!("t2")));
+        app.on_transition_done("A-1", Ok(()));
+        let moved = Issue { status_id: "2".into(), status: "Status 2".into(), sprint_id: Some(11), ..issue("A-1", "A") };
+        app.on_issue_refreshed(moved);
+        assert_eq!(app.board.find("A-1"), Some((1, 0)), "moved to its new column");
+        let Mode::EditFields(editor) = &app.mode else { panic!("stays in edit mode") };
+        assert!(editor.saving.is_none() && editor.active.is_none());
+    }
+
+    #[test]
+    fn a_transition_with_a_screen_opens_its_form_and_returns_to_edit_mode() {
+        let mut app = sprint_app();
+        find_and_open(&mut app, backlog_ticket());
+        status_picker(&mut app, "P-77");
+        app.handle_key(KeyEvent::from(KeyCode::Down)); // Status 3: has a required field
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(app.mode, Mode::TransitionForm(..)));
+        app.handle_key(KeyEvent::from(KeyCode::Esc));
+        let Mode::EditFields(editor) = &app.mode else { panic!("cancel returns to edit mode") };
+        assert_eq!(editor.field(), EditField::Status);
+
+        // Submitted through the form: edit mode waits for the refreshed card, which stays off the board.
+        load_workflow(&mut app, "P-77");
+        app.handle_key(KeyEvent::from(KeyCode::Down));
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        if let Mode::TransitionForm(form, _) = &mut app.mode {
+            form.submitting = true;
+        }
+        app.on_transition_done("P-77", Ok(()));
+        let Mode::EditFields(editor) = &app.mode else { panic!("back to edit mode") };
+        assert_eq!(editor.saving, Some(EditField::Status));
+        app.on_issue_refreshed(Issue { status_id: "3".into(), status: "Status 3".into(), ..backlog_ticket() });
+        assert!(app.board.find("P-77").is_none(), "not in the sprint: still off the board");
+        assert_eq!(app.issue("P-77").unwrap().status, "Status 3");
+    }
+
+    #[test]
+    fn a_rejected_status_change_shows_its_error_in_edit_mode() {
+        let mut app = sprint_app();
+        find_and_open(&mut app, backlog_ticket());
+        status_picker(&mut app, "P-77");
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        let mut err = JiraError::default();
+        err.messages.push("Validator failed".into());
+        app.on_transition_done("P-77", Err(err));
+        let Mode::EditFields(editor) = &app.mode else { panic!() };
+        assert!(editor.saving.is_none());
+        assert!(editor.error.as_deref().unwrap().contains("Validator failed"));
+    }
+
+    #[test]
+    fn typing_in_the_finder_does_not_trigger_board_keys() {
+        let mut app = sprint_app();
+        press(&mut app, 'f');
+        for c in "q?ag".chars() {
+            press(&mut app, c);
+        }
+        let Mode::Find(finder) = &app.mode else { panic!("still finding") };
+        assert_eq!(finder.query, "q?ag");
+        assert_eq!(app.grouping, Grouping::None);
+    }
+
+    #[test]
+    fn off_board_cards_cannot_enter_move_mode() {
+        let mut app = sprint_app();
+        find_and_open(&mut app, backlog_ticket());
+        assert!(matches!(app.handle_key(KeyEvent::from(KeyCode::Char('m'))), Action::None));
+        assert!(matches!(app.mode, Mode::Details { .. }));
     }
 
     fn click(app: &mut App, target: HitTarget) -> Action {

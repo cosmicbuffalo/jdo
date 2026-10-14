@@ -13,7 +13,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::app::{App, CommentsState, CreateHit, Hit, HitTarget, LaneFocus, Mode, RichEditor, RichState, StatusLevel};
-use crate::create::{CreateField, CreateFocus, CreateForm, PickOption};
+use crate::create::{CreateField, CreateFocus, CreateForm, PickOption, Picker};
+use crate::edit::{Active, EditField, FieldEditor};
+use crate::find::Finder;
 use crate::jira::adf;
 use crate::colors::{self, UserColors};
 use crate::form::{FieldKind, TransitionForm};
@@ -61,8 +63,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if let Mode::Help { .. } = &app.mode {
         draw_help(frame);
     }
-    if let Mode::Details { .. } = &app.mode {
+    if let Mode::Details { .. } | Mode::EditFields(_) = &app.mode {
         draw_details(frame, app);
+    }
+    if let Mode::Find(_) = &app.mode {
+        draw_find(frame, app);
     }
     if let Mode::TransitionForm(form, _) = &mut app.mode {
         draw_form(frame, form);
@@ -741,6 +746,7 @@ fn footer_hints(app: &App) -> (&'static str, Vec<Hint>) {
             let mut hints = vec![
                 nav("hjkl/arrows navigate"),
                 hint("enter details", Enter),
+                hint("f find", Char('f')),
                 hint("m move", Char('m')),
                 // Same width either way, so `g group` stays put.
                 hint(if app.mine_only { "a show all " } else { "a only mine" }, Char('a')),
@@ -758,7 +764,7 @@ fn footer_hints(app: &App) -> (&'static str, Vec<Hint>) {
             "DETAILS",
             vec![
                 nav("j/k scroll"),
-                hint("e edit description", Char('e')),
+                hint("e edit fields", Char('e')),
                 hint("a edit acceptance criteria", Char('a')),
                 hint("m move", Char('m')),
                 hint("esc close", Esc),
@@ -780,6 +786,31 @@ fn footer_hints(app: &App) -> (&'static str, Vec<Hint>) {
                 hint_with("^s save", Char('s'), KeyModifiers::CONTROL),
                 hint_with("^g $EDITOR", Char('g'), KeyModifiers::CONTROL),
                 hint("esc cancel", Esc),
+            ],
+        ),
+        Mode::Find(_) => (
+            "FIND",
+            vec![
+                nav("type to search"),
+                nav("↑/↓ select"),
+                hint("enter open", Enter),
+                hint("esc close", Esc),
+            ],
+        ),
+        Mode::EditFields(editor) if matches!(editor.active, Some(Active::Pick(_) | Active::Status(_))) => (
+            "PICK",
+            vec![nav("type to filter"), nav("↑/↓ select"), hint("enter choose", Enter), hint("esc back", Esc)],
+        ),
+        Mode::EditFields(editor) if editor.active.is_some() => {
+            ("EDIT", vec![hint("enter save", Enter), hint("esc discard", Esc)])
+        }
+        Mode::EditFields(_) => (
+            "EDIT FIELDS",
+            vec![
+                nav("j/k field"),
+                hint("enter change", Enter),
+                hint("esc done", Esc),
+                hint("? keymap", Char('?')),
             ],
         ),
         Mode::Moving(_) => (
@@ -853,7 +884,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &mut App) {
 // ----- keymap --------------------------------------------------------------
 
 fn draw_help(frame: &mut Frame) {
-    let area = centered(frame.area(), 90, 24);
+    let area = centered(frame.area(), 90, 33);
     let heading = |text: &'static str| Line::styled(text, Style::default().fg(ACCENT).add_modifier(Modifier::BOLD));
     let key = |keys: &'static str, action: &'static str| {
         Line::from(vec![
@@ -872,6 +903,7 @@ fn draw_help(frame: &mut Frame) {
         key("Home / End", "first / last card (or header)"),
         key("1-9", "jump to a column"),
         key("Enter", "open card details"),
+        key("f", "find any ticket in the project"),
         key("m", "enter MOVE mode for the card"),
         key("c", "create a new card"),
         key("a", "only my cards (toggle)"),
@@ -885,9 +917,17 @@ fn draw_help(frame: &mut Frame) {
         key("j / k", "scroll"),
         key("^d / ^u", "scroll half a page"),
         key("g / G", "top / bottom"),
-        key("e / a", "edit description / acceptance"),
+        key("e", "EDIT FIELDS mode"),
+        key("a", "edit acceptance criteria"),
         key("m", "move this card"),
         key("Esc / q", "close details"),
+        Line::raw(""),
+        heading("FIND"),
+        key("type", "search key / title / text"),
+        key("↑ / ↓  ^p / ^n", "select a result"),
+        key("Enter", "open it (Esc comes back)"),
+        key("^u / ^w", "clear query / delete word"),
+        Line::styled("  Empty query: tickets you created.", Style::default().fg(MUTED)),
     ];
     let right = vec![
         heading("MOVE MODE"),
@@ -902,6 +942,12 @@ fn draw_help(frame: &mut Frame) {
         key("Enter / e", "edit field / open options"),
         key("Ctrl-S", "submit the move"),
         key("Esc", "cancel the move"),
+        Line::raw(""),
+        heading("EDIT FIELDS"),
+        key("j / k / Tab", "select a field"),
+        key("Enter", "change it (type to filter)"),
+        Line::styled("  Status offers the workflow's next steps.", Style::default().fg(MUTED)),
+        key("Esc", "back to details"),
         Line::raw(""),
         heading("EDITING DESCRIPTION / AC"),
         key("Ctrl-S", "save to Jira (Markdown)"),
@@ -931,15 +977,25 @@ fn draw_help(frame: &mut Frame) {
 // ----- details -------------------------------------------------------------
 
 fn draw_details(frame: &mut Frame, app: &mut App) {
-    let Mode::Details { key, .. } = &app.mode else { return };
+    let (key, editing) = match &app.mode {
+        Mode::Details { key, .. } => (key, None),
+        Mode::EditFields(editor) => (&editor.key, Some(editor.field())),
+        _ => return,
+    };
+    let spinner = app.spinner();
     let area = centered(frame.area(), 92, frame.area().height.saturating_mul(9) / 10);
     let width = area.width.saturating_sub(4).max(10) as usize;
 
-    let lines = match app.board.issue(key) {
-        Some(issue) => detail_lines(issue, app.comments.get(key), app.rich.get(key), width, &app.user_colors),
-        None => vec![Line::styled(format!("{key} is no longer on this board."), Style::default().fg(MUTED))],
+    let on_board = app.board.find(key).is_some();
+    let (lines, cursor_line) = match app.issue(key) {
+        Some(issue) => detail_lines(issue, app.comments.get(key), app.rich.get(key), width, &app.user_colors, editing),
+        None => (vec![Line::styled(format!("{key} is no longer on this board."), Style::default().fg(MUTED))], None),
     };
-    let title = format!(" {key} · details ");
+    let title = match (editing, on_board) {
+        (Some(_), _) => format!(" {key} · edit fields "),
+        (None, true) => format!(" {key} · details "),
+        (None, false) => format!(" {key} · details · not on this board "),
+    };
 
     frame.render_widget(Clear, area);
     let block = modal_block(&title);
@@ -962,35 +1018,272 @@ fn draw_details(frame: &mut Frame, app: &mut App) {
     }
 
     let max_scroll = (lines.len() as u16).saturating_sub(content.height);
-    let Mode::Details { scroll, .. } = &mut app.mode else { return };
-    *scroll = (*scroll).min(max_scroll);
-    let position = if max_scroll == 0 {
-        String::new()
-    } else {
-        format!(" · {}%", (*scroll as u32 * 100 / max_scroll as u32))
+    let (scroll, hint_line) = match &mut app.mode {
+        Mode::Details { scroll, .. } => {
+            *scroll = (*scroll).min(max_scroll);
+            let position = if max_scroll == 0 {
+                String::new()
+            } else {
+                format!(" · {}%", (*scroll as u32 * 100 / max_scroll as u32))
+            };
+            let text = format!("j/k or wheel scroll · e edit · m move · Esc or [×] close{position}");
+            (*scroll, Line::styled(text, Style::default().fg(MUTED)))
+        }
+        Mode::EditFields(editor) => {
+            // Keep the field under the cursor on screen.
+            if let Some(at) = cursor_line.map(|l| l as u16) {
+                let height = content.height.max(1);
+                if at < editor.scroll {
+                    editor.scroll = at.saturating_sub(1);
+                } else if at >= editor.scroll + height {
+                    editor.scroll = at + 1 - height;
+                }
+            }
+            editor.scroll = editor.scroll.min(max_scroll);
+            let line = match (&editor.saving, &editor.error) {
+                (Some(field), _) => Line::styled(
+                    format!("{spinner} saving {} to Jira…", field.label().to_lowercase()),
+                    Style::default().fg(CHANGE),
+                ),
+                (None, Some(error)) => Line::styled(format!("⚠ {error}"), Style::default().fg(DANGER)),
+                (None, None) => Line::styled("j/k field · Enter change · Esc done", Style::default().fg(MUTED)),
+            };
+            (editor.scroll, line)
+        }
+        _ => return,
     };
 
-    frame.render_widget(Paragraph::new(lines).scroll((*scroll, 0)), content);
+    frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), content);
+    frame.render_widget(Paragraph::new(hint_line).alignment(Alignment::Center), hint);
+
+    if let Mode::EditFields(editor) = &mut app.mode {
+        draw_edit_popup(frame, editor, &app.user_colors);
+    }
+}
+
+/// The input or picker for the field being changed, over the details.
+fn draw_edit_popup(frame: &mut Frame, editor: &mut FieldEditor, people: &UserColors) {
+    let field = editor.field();
+    let error = editor.error.clone();
+    let screen = frame.area();
+    match &mut editor.active {
+        None => {}
+        Some(Active::Text(area)) => {
+            let width = (screen.width * 6 / 10).max(50).min(screen.width);
+            let height = 4 + u16::from(error.is_some());
+            let popup = centered_fixed(screen, width, height);
+            frame.render_widget(Clear, popup);
+            let block = modal_block(&format!(" {} ", field.label()));
+            let inner = block.inner(popup);
+            frame.render_widget(block, popup);
+            let [input, error_area, hint] = Layout::vertical([
+                Constraint::Length(1),
+                Constraint::Length(u16::from(error.is_some())),
+                Constraint::Length(1),
+            ])
+            .areas(inner);
+            area.set_cursor_line_style(Style::default());
+            area.set_style(Style::default().fg(TEXT).bg(BACKGROUND));
+            area.set_cursor_style(Style::default().fg(BACKGROUND).bg(ACCENT));
+            frame.render_widget(&*area, input.inner(Margin::new(1, 0)));
+            if let Some(error) = error {
+                frame.render_widget(Paragraph::new(Span::styled(format!(" ⚠ {error}"), Style::default().fg(DANGER))), error_area);
+            }
+            let text = if field == EditField::StoryPoints { "Enter save (empty clears) · Esc discard" } else { "Enter save · Esc discard" };
+            frame.render_widget(Paragraph::new(text).alignment(Alignment::Center).style(Style::default().fg(MUTED)), hint);
+        }
+        Some(Active::Pick(picker)) => draw_edit_picker(frame, field, picker, people),
+        Some(Active::Status(Some(workflow))) => draw_edit_picker(frame, field, &workflow.picker, people),
+        Some(Active::Status(None)) => {
+            let popup = centered_fixed(screen, 40.min(screen.width), 3);
+            frame.render_widget(Clear, popup);
+            let block = modal_block(" Status ");
+            let inner = block.inner(popup);
+            frame.render_widget(block, popup);
+            frame.render_widget(
+                Paragraph::new("loading the workflow…").alignment(Alignment::Center).style(Style::default().fg(MUTED)),
+                inner,
+            );
+        }
+    }
+}
+
+/// A type-to-filter list for assignee, sprint or epic.
+fn draw_edit_picker(frame: &mut Frame, field: EditField, picker: &Picker, people: &UserColors) {
+    let screen = frame.area();
+    let options = picker.matches();
+    let visible = options.len().clamp(1, 12);
+    let width = (screen.width / 2).max(50).min(screen.width);
+    let area = centered_fixed(screen, width, visible as u16 + 4);
+    frame.render_widget(Clear, area);
+    let block = modal_block(&format!(" {} ", field.label()));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let [filter, list, hint] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)]).areas(inner);
+
+    let mut spans = vec![Span::styled(" › ", Style::default().fg(ACCENT)), Span::styled(picker.filter.clone(), Style::default().fg(TEXT))];
+    spans.push(Span::styled(" ", Style::default().bg(ACCENT)));
+    if picker.filter.is_empty() {
+        spans.push(Span::styled("  type to filter", Style::default().fg(MUTED)));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), filter);
+
+    // Draw with the create dialog's look: epics in color, people as pills.
+    let as_create = match field {
+        EditField::Assignee => CreateField::Assignee,
+        EditField::Epic => CreateField::Epic,
+        _ => CreateField::Sprint,
+    };
+    let start = (picker.highlight + 1).saturating_sub(list.height as usize);
+    let mut lines: Vec<Line> = options
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(list.height as usize)
+        .map(|(i, option)| {
+            let mut spans = vec![Span::styled(if i == picker.highlight { " ▊ " } else { "   " }, Style::default().fg(ACCENT))];
+            spans.extend(pick_spans(as_create, option, people));
+            Line::from(spans)
+        })
+        .collect();
+    if lines.is_empty() {
+        lines.push(Line::styled("   no matches", Style::default().fg(MUTED)));
+    }
+    frame.render_widget(Paragraph::new(lines), list);
     frame.render_widget(
-        Paragraph::new(format!("j/k or wheel scroll · m move · Esc or [×] close{position}"))
+        Paragraph::new("↑/↓ select · Enter choose · Esc back").alignment(Alignment::Center).style(Style::default().fg(MUTED)),
+        hint,
+    );
+}
+
+// ----- find ----------------------------------------------------------------
+
+/// The `f` dialog: a query box over the results.
+fn draw_find(frame: &mut Frame, app: &mut App) {
+    let spinner = app.spinner();
+    let screen = frame.area();
+    let area = centered(screen, 80, screen.height.saturating_mul(8) / 10);
+    frame.render_widget(Clear, area);
+    let block = modal_block(" find a ticket ");
+    let inner = block.inner(area).inner(Margin::new(1, 0));
+    frame.render_widget(block, area);
+    let [query_area, status_area, list, hint] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+
+    let Mode::Find(finder) = &app.mode else { return };
+    let mut spans = vec![
+        Span::styled("› ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled(finder.query.clone(), Style::default().fg(TEXT)),
+        Span::styled(" ", Style::default().bg(ACCENT)),
+    ];
+    if finder.query.is_empty() {
+        spans.push(Span::styled("  key, number, or words from the title / description", Style::default().fg(MUTED)));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), query_area);
+    frame.render_widget(Paragraph::new(find_status(finder, spinner, &app.board.project_key)), status_area);
+
+    let width = list.width as usize;
+    let key_width = finder.results.iter().map(|i| i.key.width()).max().unwrap_or(0);
+    let start = (finder.highlight + 1).saturating_sub(list.height as usize);
+    let rows: Vec<(usize, Line<'static>)> = finder
+        .results
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(list.height as usize)
+        .map(|(i, issue)| (i, find_row(issue, i == finder.highlight, app.board.find(&issue.key).is_some(), key_width, width)))
+        .collect();
+    for (row, (i, line)) in rows.into_iter().enumerate() {
+        let rect = Rect::new(list.x, list.y + row as u16, list.width, 1);
+        frame.render_widget(Paragraph::new(line), rect);
+        app.hits.push(Hit { area: rect, target: HitTarget::FindResult(i) });
+    }
+    frame.render_widget(
+        Paragraph::new("type to search · ↑/↓ select · Enter open · Esc close")
             .alignment(Alignment::Center)
             .style(Style::default().fg(MUTED)),
         hint,
     );
 }
 
+/// What the result list holds, or why it's empty.
+fn find_status(finder: &Finder, spinner: &'static str, project: &str) -> Line<'static> {
+    let scope = if project.is_empty() { "Jira".to_string() } else { project.to_string() };
+    let what = if finder.query.trim().is_empty() {
+        format!("tickets you created in {scope}, newest first")
+    } else {
+        format!("{} match{} in {scope}", finder.results.len(), if finder.results.len() == 1 { "" } else { "es" })
+    };
+    let mut spans = vec![Span::styled(what, Style::default().fg(MUTED))];
+    if finder.is_busy() {
+        spans.push(Span::styled(format!("  {spinner} searching…"), Style::default().fg(ACCENT)));
+    } else if let Some(error) = &finder.error {
+        spans.push(Span::styled(format!("  ⚠ search failed: {error}"), Style::default().fg(DANGER)));
+    } else if finder.results.is_empty() {
+        spans.push(Span::styled("  · nothing found", Style::default().fg(MUTED)));
+    }
+    Line::from(spans)
+}
+
+/// `▊ KEY  summary …  Status · Sprint`; cards on the board are marked `●`.
+fn find_row(issue: &Issue, selected: bool, on_board: bool, key_width: usize, width: usize) -> Line<'static> {
+    let sprint = issue.sprint.clone().unwrap_or_else(|| "backlog".into());
+    let right = format!("  {} · {}", issue.status, sprint);
+    let left = 2 + 2 + key_width + 2;
+    let summary_width = width.saturating_sub(left + right.width()).max(10);
+    let summary = truncate(&issue.summary, summary_width);
+    let padding = width.saturating_sub(left + summary.width() + right.width());
+    let summary_style = if selected { Style::default().fg(ACCENT).add_modifier(Modifier::BOLD) } else { Style::default().fg(TEXT) };
+    Line::from(vec![
+        Span::styled(if selected { "▊ " } else { "  " }, Style::default().fg(ACCENT)),
+        Span::styled(if on_board { "● " } else { "  " }, Style::default().fg(REACHABLE)),
+        Span::styled(format!("{:<key_width$}  ", issue.key), Style::default().fg(SUBTLE)),
+        Span::styled(summary, summary_style),
+        Span::raw(" ".repeat(padding)),
+        Span::styled(right, Style::default().fg(MUTED)),
+    ])
+}
+
+/// The details view's lines. In edit mode (`editing` is the field under the
+/// cursor) every row gets a margin, editable rows a `▊` when selected; also
+/// returns the selected row's line.
 fn detail_lines(
     issue: &Issue,
     comments: Option<&CommentsState>,
     rich: Option<&RichState>,
     width: usize,
     people: &UserColors,
-) -> Vec<Line<'static>> {
+    editing: Option<EditField>,
+) -> (Vec<Line<'static>>, Option<usize>) {
     let mut lines = Vec::new();
+    let mut cursor_line = None;
     let heading = |text: String| Line::styled(text, Style::default().fg(ACCENT).add_modifier(Modifier::BOLD));
+    let margin = if editing.is_some() { 2 } else { 0 };
+    let width = width.saturating_sub(margin);
+    // The edit-mode margin for a row of `field` (if it's one).
+    let mark = |field: Option<EditField>| -> Option<Span<'static>> {
+        editing?;
+        Some(Span::styled(if field.is_some() && field == editing { "▊ " } else { "  " }, Style::default().fg(ACCENT)))
+    };
+    let selected = |field: EditField| editing == Some(field);
+    let label_style = |field: Option<EditField>| match field {
+        Some(f) if selected(f) => Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        _ => Style::default().fg(MUTED),
+    };
 
-    for chunk in wrap(&issue.summary, width) {
-        lines.push(Line::styled(chunk, Style::default().fg(TEXT).add_modifier(Modifier::BOLD)));
+    if selected(EditField::Summary) {
+        cursor_line = Some(lines.len());
+    }
+    for (i, chunk) in wrap(&issue.summary, width).into_iter().enumerate() {
+        let style = if selected(EditField::Summary) { Style::default().fg(ACCENT) } else { Style::default().fg(TEXT) };
+        let field = (i == 0).then_some(EditField::Summary);
+        lines.push(Line::from_iter(mark(field).into_iter().chain([Span::styled(chunk, style.add_modifier(Modifier::BOLD))])));
     }
     lines.push(Line::raw(""));
 
@@ -1008,48 +1301,73 @@ fn detail_lines(
     ];
     let label_width = fields.iter().map(|(l, _)| l.len()).max().unwrap_or(0) + 2;
     for (label, value) in fields {
+        let field = match label {
+            "Status" => Some(EditField::Status),
+            "Assignee" => Some(EditField::Assignee),
+            "Story Points" => Some(EditField::StoryPoints),
+            "Sprint" => Some(EditField::Sprint),
+            "Epic" => Some(EditField::Epic),
+            _ => None,
+        };
+        if field.is_some_and(selected) {
+            cursor_line = Some(lines.len());
+        }
+        let start = lines.len();
         if label == "Assignee" {
-            let mut spans = vec![Span::styled(format!("{label:<label_width$}"), Style::default().fg(MUTED))];
+            let mut spans = vec![Span::styled(format!("{label:<label_width$}"), label_style(field))];
             match &issue.assignee {
                 Some(name) => spans.extend(user_pill(name, people.color(name))),
                 None => spans.extend(unassigned_pill()),
             }
             lines.push(Line::from(spans));
-            continue;
-        }
-        if let ("Epic", Some(epic)) = (label, &issue.epic) {
+        } else if let ("Epic", Some(epic)) = (label, &issue.epic) {
             lines.push(Line::from(vec![
-                Span::styled(format!("{label:<label_width$}"), Style::default().fg(MUTED)),
+                Span::styled(format!("{label:<label_width$}"), label_style(field)),
                 epic_pill(epic, &epic.name),
                 Span::styled(format!("  {}", epic.key), Style::default().fg(MUTED)),
             ]));
-            continue;
+        } else {
+            let value_width = width.saturating_sub(label_width).max(10);
+            for (i, chunk) in wrap(&value, value_width).into_iter().enumerate() {
+                let label_text = if i == 0 { format!("{label:<label_width$}") } else { " ".repeat(label_width) };
+                lines.push(Line::from(vec![
+                    Span::styled(label_text, label_style(field)),
+                    Span::styled(chunk, Style::default().fg(TEXT)),
+                ]));
+            }
         }
-        let value_width = width.saturating_sub(label_width).max(10);
-        for (i, chunk) in wrap(&value, value_width).into_iter().enumerate() {
-            let label_text = if i == 0 { format!("{label:<label_width$}") } else { " ".repeat(label_width) };
-            lines.push(Line::from(vec![
-                Span::styled(label_text, Style::default().fg(MUTED)),
-                Span::styled(chunk, Style::default().fg(TEXT)),
-            ]));
+        // Only a field's first line carries its marker.
+        for (i, line) in lines[start..].iter_mut().enumerate() {
+            if let Some(span) = mark(if i == 0 { field } else { None }) {
+                line.spans.insert(0, span);
+            }
         }
     }
 
     // Prefer the rich document (fetched on open) over the board API's plain text.
-    for (field, fallback, key) in [
-        (RichField::Description, &issue.description, "e"),
-        (RichField::AcceptanceCriteria, &issue.acceptance_criteria, "a"),
+    for (field, edit_field, fallback, key) in [
+        (RichField::Description, EditField::Description, &issue.description, "e"),
+        (RichField::AcceptanceCriteria, EditField::AcceptanceCriteria, &issue.acceptance_criteria, "a"),
     ] {
         let body = match rich.and_then(|r| r.get(field)) {
             Some(value) => adf::to_text(Some(value)),
             None => fallback.clone(),
         };
         lines.push(Line::raw(""));
-        lines.push(Line::from(vec![
-            Span::styled(field.label().to_string(), Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
-            Span::styled(format!("  {key} to edit"), Style::default().fg(MUTED)),
-        ]));
-        push_body(&mut lines, &body, width, 0);
+        if selected(edit_field) {
+            cursor_line = Some(lines.len());
+        }
+        let hint = match editing {
+            None => format!("  {key} to edit"),
+            Some(_) if selected(edit_field) => "  Enter to edit as Markdown".into(),
+            Some(_) => String::new(),
+        };
+        let title_style = if editing.is_some() && !selected(edit_field) { Style::default().fg(SUBTLE) } else { Style::default().fg(ACCENT) };
+        lines.push(Line::from_iter(mark(Some(edit_field)).into_iter().chain([
+            Span::styled(field.label().to_string(), title_style.add_modifier(Modifier::BOLD)),
+            Span::styled(hint, Style::default().fg(MUTED)),
+        ])));
+        push_body(&mut lines, &body, width + margin, margin);
     }
 
     lines.push(Line::raw(""));
@@ -1076,7 +1394,7 @@ fn detail_lines(
             }
         }
     }
-    lines
+    (lines, cursor_line)
 }
 
 fn push_body(lines: &mut Vec<Line<'static>>, body: &str, width: usize, indent: usize) {

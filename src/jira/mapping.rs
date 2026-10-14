@@ -114,7 +114,8 @@ pub fn map_issue(raw: &RawIssue, fields: &FieldMap, browse_base: &str) -> Issue 
         description: adf::to_text(f.get("description")),
         acceptance_criteria: adf::to_text(f.get(&fields.acceptance_criteria)),
         story_points: f.get(&fields.story_points).and_then(Value::as_f64),
-        sprint: active_sprint_name(f.get(&fields.sprint)),
+        sprint: current_sprint(f.get(&fields.sprint)).and_then(|s| s.get("name")?.as_str().map(str::to_string)),
+        sprint_id: current_sprint(f.get(&fields.sprint)).and_then(|s| s.get("id")?.as_u64()),
         team: f.get(&fields.team).and_then(|t| {
             Some(TeamRef {
                 id: t.get("id")?.as_str()?.to_string(),
@@ -169,15 +170,14 @@ fn epic_of(f: &Value, fields: &FieldMap) -> Option<EpicRef> {
 
 /// The Sprint field is a list of sprint objects (history). Prefer the active
 /// one, else the last entry.
-fn active_sprint_name(value: Option<&Value>) -> Option<String> {
+fn current_sprint(value: Option<&Value>) -> Option<&Value> {
     let arr = value?.as_array()?;
     let active = arr.iter().find(|s| {
         s.get("state")
             .and_then(Value::as_str)
             .is_some_and(|st| st.eq_ignore_ascii_case("active"))
     });
-    let chosen = active.or_else(|| arr.last())?;
-    chosen.get("name").and_then(Value::as_str).map(str::to_string)
+    active.or_else(|| arr.last())
 }
 
 /// Available transitions, in Jira's order.
