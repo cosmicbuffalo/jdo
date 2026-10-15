@@ -21,6 +21,8 @@ use crate::model::{Board, Comment, Issue, RawFields, RichField, SprintRef, Trans
 /// UI → worker requests.
 pub enum Command {
     LoadBoard { board_id: u64 },
+    /// Who the signed-in user is (asked at startup; again if that failed).
+    FetchMyself,
     /// Workflow transitions from the issue's current status, plus the issue's
     /// current values for every field on their screens (to pre-fill forms).
     FetchTransitions { key: String },
@@ -49,6 +51,7 @@ pub enum Event {
     Board(Board),
     BoardError(String),
     Myself { account_id: String, display_name: String },
+    MyselfFailed(String),
     Transitions {
         key: String,
         result: Result<(Vec<Transition>, RawFields), String>,
@@ -128,17 +131,18 @@ fn run(
     cmd_rx: Receiver<Command>,
     evt_tx: Sender<Event>,
 ) {
-    // Needed for "assign to me" in transition forms; failure is non-fatal.
-    if let Ok(me) = client.myself() {
-        let _ = evt_tx.send(Event::Myself {
-            account_id: me.account_id,
-            display_name: me.display_name,
-        });
-    }
+    // Needed for "only mine" and "assign to me"; failure is non-fatal (the
+    // UI asks again when it needs it). One retry rides out a blip.
+    let me = client.myself().or_else(|_| {
+        thread::sleep(std::time::Duration::from_secs(2));
+        client.myself()
+    });
+    let _ = evt_tx.send(myself_event(me));
 
     while let Ok(cmd) = cmd_rx.recv() {
         let event = match cmd {
             Command::Shutdown => break,
+            Command::FetchMyself => myself_event(client.myself()),
             Command::LoadBoard { board_id } => {
                 match load_board(&client, &fields, &browse_base, board_id) {
                     Ok(board) => Event::Board(board),
@@ -241,6 +245,13 @@ fn run(
         if evt_tx.send(event).is_err() {
             break; // UI gone
         }
+    }
+}
+
+fn myself_event(result: anyhow::Result<crate::jira::wire::Myself>) -> Event {
+    match result {
+        Ok(me) => Event::Myself { account_id: me.account_id, display_name: me.display_name },
+        Err(err) => Event::MyselfFailed(format!("{err:#}")),
     }
 }
 

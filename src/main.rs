@@ -132,9 +132,8 @@ fn run_event_loop(
             match event {
                 SyncEvent::Board(board) => app.on_board(board),
                 SyncEvent::BoardError(message) => app.on_board_error(message),
-                SyncEvent::Myself { account_id, display_name } => {
-                    app.me = Some((account_id, display_name));
-                }
+                SyncEvent::Myself { account_id, display_name } => app.on_myself(account_id, display_name),
+                SyncEvent::MyselfFailed(message) => app.on_myself_failed(message),
                 SyncEvent::Transitions { key, result } => app.on_transitions(&key, result),
                 SyncEvent::TransitionDone { key, result } => app.on_transition_done(&key, result),
                 SyncEvent::IssueRefreshed(issue) => app.on_issue_refreshed(issue),
@@ -190,6 +189,7 @@ fn dispatch(
         }
         Action::Quit => return true,
         Action::Refresh => worker.send(Command::LoadBoard { board_id }),
+        Action::FetchMyself => worker.send(Command::FetchMyself),
         Action::FetchTransitions(key) => worker.send(Command::FetchTransitions { key }),
         Action::SubmitTransition { key, body } => worker.send(Command::DoTransition { key, body }),
         Action::FetchDetails(key) => {

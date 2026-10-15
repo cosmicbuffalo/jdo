@@ -29,6 +29,8 @@ pub enum Action {
     None,
     Quit,
     Refresh,
+    /// Ask Jira who the signed-in user is.
+    FetchMyself,
     FetchTransitions(String),
     SubmitTransition { key: String, body: Value },
     /// Load what the details view needs: comments and the rich-text fields.
@@ -236,6 +238,8 @@ pub struct App {
     find_return: Option<Box<Finder>>,
     /// `(accountId, displayName)` of the signed-in user.
     pub me: Option<(String, String)>,
+    /// `a` was pressed before Jira said who you are; filter once it does.
+    mine_pending: bool,
     /// Moves submitted without a form, awaiting Jira's verdict.
     in_flight: HashMap<String, PendingMove>,
     /// A refreshed board that arrived mid-move; applied once the move settles.
@@ -273,6 +277,7 @@ impl App {
             loose: HashMap::new(),
             find_return: None,
             me: None,
+            mine_pending: false,
             in_flight: HashMap::new(),
             deferred_board: None,
         }
@@ -358,9 +363,28 @@ impl App {
             .unwrap_or_default()
     }
 
-    fn toggle_mine(&mut self) {
+    pub fn on_myself(&mut self, account_id: String, display_name: String) {
+        self.me = Some((account_id, display_name));
+        if std::mem::take(&mut self.mine_pending) {
+            self.toggle_mine();
+        }
+    }
+
+    pub fn on_myself_failed(&mut self, message: String) {
+        if std::mem::take(&mut self.mine_pending) {
+            self.error(format!("can't filter: Jira's /myself failed — {message} (press a to try again)"));
+        }
+    }
+
+    fn toggle_mine(&mut self) -> Action {
         if self.me.is_none() {
-            return self.error("can't filter yet: jdo doesn't know who you are (Jira's /myself failed)");
+            // Startup's /myself failed or hasn't answered yet: ask (again).
+            if self.mine_pending {
+                return Action::None;
+            }
+            self.mine_pending = true;
+            self.info("asking Jira who you are…");
+            return Action::FetchMyself;
         }
         let selected = self.selected_issue().map(|i| i.key.clone());
         self.mine_only = !self.mine_only;
@@ -377,6 +401,7 @@ impl App {
         } else {
             self.info("showing everyone's cards");
         }
+        Action::None
     }
 
     fn select_key(&mut self, key: &str) -> bool {
@@ -1231,7 +1256,7 @@ impl App {
         }
         match key.code {
             KeyCode::Char('g') => self.cycle_grouping(),
-            KeyCode::Char('a') => self.toggle_mine(),
+            KeyCode::Char('a') => return self.toggle_mine(),
             KeyCode::Char('q') => return Action::Quit,
             KeyCode::Char('r') => {
                 if self.board_loaded {
@@ -2145,8 +2170,17 @@ mod tests {
     #[test]
     fn the_filter_needs_to_know_who_i_am_and_survives_a_restart() {
         let mut app = app();
-        press(&mut app, 'a');
+        let action = app.handle_key(KeyEvent::from(KeyCode::Char('a')));
+        assert!(matches!(action, Action::FetchMyself), "asks Jira again");
         assert!(!app.mine_only);
+        assert!(matches!(app.handle_key(KeyEvent::from(KeyCode::Char('a'))), Action::None), "one ask at a time");
+        app.on_myself_failed("HTTP 429".into());
+        assert!(!app.mine_only);
+        assert!(app.status.as_ref().unwrap().0.contains("HTTP 429"), "the reason is shown");
+        assert!(matches!(app.handle_key(KeyEvent::from(KeyCode::Char('a'))), Action::FetchMyself), "a retries");
+        app.on_myself("acct-me".into(), "Me".into());
+        assert!(app.mine_only, "the filter applies once Jira answers");
+
         let mut app = mine_app();
         press(&mut app, 'a');
         let mut after = App::new(Board::default(), 1);
