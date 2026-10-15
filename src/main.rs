@@ -2,7 +2,7 @@
 //!
 //! P1: fetches a real board (Agile API) via a background worker and renders it.
 //! `--dump` prints a text summary and exits (no TUI) — handy for testing auth
-//! and the mapping.
+//! and the mapping. See `docs/DESIGN.md` for the overall shape.
 
 // Some scaffolded items are unused until later phases; keep the build quiet.
 #![allow(dead_code)]
@@ -62,6 +62,9 @@ struct Cli {
     /// Fetch the board and print a text summary, then exit (no TUI).
     #[arg(long)]
     dump: bool,
+    /// Show which custom-field ids jdo uses and where each came from, then exit.
+    #[arg(long)]
+    fields: bool,
     /// Don't capture the mouse (keeps the terminal's own text selection).
     #[arg(long)]
     no_mouse: bool,
@@ -70,20 +73,29 @@ struct Cli {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    let mut cfg = config::load()?;
-    if let Some(board) = cli.board {
-        cfg.board_id = board;
-    }
+    let cfg = config::load(cli.board)?;
     let creds = config::credentials()?;
 
     let auth = ApiTokenAuth::new(&cfg.base_url, &creds.email, &creds.token);
     let client = JiraClient::new(Box::new(auth))?;
 
+    // Pinned fields need no lookup; otherwise ask the site's catalog.
+    let catalog = if cfg.fields.complete() && !cli.fields {
+        Vec::new()
+    } else {
+        client.fields().context("look up custom-field ids in Jira's field catalog")?
+    };
+    let (fields, resolutions) = jira::fields::resolve(&cfg.fields, &catalog);
+
+    if cli.fields {
+        print_fields(&resolutions);
+        return Ok(());
+    }
     if cli.dump {
-        return dump_board(&client, &cfg);
+        return dump_board(&client, &fields, cfg.board_id);
     }
 
-    let worker = sync::spawn(client, cfg.fields.clone(), cfg.base_url.clone());
+    let worker = sync::spawn(client, fields, cfg.base_url.clone());
     worker
         .tx
         .send(Command::LoadBoard { board_id: cfg.board_id })
@@ -215,13 +227,37 @@ fn dispatch(
 }
 
 /// Headless fetch + print, for testing auth and mapping without the TUI.
-fn dump_board(client: &JiraClient, cfg: &config::JiraConfig) -> Result<()> {
-    let board = sync::load_board(client, &cfg.fields, client.browse_base(), cfg.board_id)?;
+/// `jdo --fields`: the id behind each custom field, for checking or pinning
+/// in `[jira.fields]`.
+fn print_fields(resolutions: &[jira::fields::Resolution]) {
+    use jira::fields::Source;
+    let mut out = io::stdout().lock();
+    let _ = (|| -> io::Result<()> {
+        for r in resolutions {
+            let source = match r.source {
+                Source::Config => "pinned in config",
+                Source::Catalog => "auto-detected",
+                Source::Missing => "not on this site",
+            };
+            let name = r.candidates.iter().find(|(id, _)| *id == r.id).map(|(_, n)| n.as_str());
+            let shown = if r.id.is_empty() { "-".to_string() } else { r.id.clone() };
+            let line = format!("{:<20} {:<20} {:<17} {}", r.key, shown, source, name.unwrap_or(""));
+            writeln!(out, "{}", line.trim_end())?;
+            for (id, name) in r.candidates.iter().filter(|(id, _)| *id != r.id) {
+                writeln!(out, "{:<20}   also matches {id} ({name})", "")?;
+            }
+        }
+        Ok(())
+    })();
+}
+
+fn dump_board(client: &JiraClient, fields: &config::FieldMap, board_id: u64) -> Result<()> {
+    let board = sync::load_board(client, fields, client.browse_base(), board_id)?;
 
     // Write errors (e.g. a closed pipe from `| head`) just end the dump.
     let mut out = io::stdout().lock();
     let _ = (|| -> io::Result<()> {
-        writeln!(out, "Board: {} (id {}) — {}", board.name, cfg.board_id, board.scope)?;
+        writeln!(out, "Board: {} (id {}) — {}", board.name, board_id, board.scope)?;
         for column in &board.columns {
             writeln!(out, "\n== {} ({}) ==", column.name, column.issues.len())?;
             for issue in &column.issues {

@@ -2,7 +2,7 @@
 //!
 //! Only the fields jdo consumes are modeled. Issue `fields` are kept as a raw
 //! `serde_json::Value` because the custom-field ids are project-specific and
-//! resolved dynamically (see [`crate::jira::mapping`] and [`crate::config::FieldMap`]).
+//! resolved dynamically (see [`crate::jira::mapping`] and [`crate::jira::fields`]).
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -157,6 +157,23 @@ pub struct Myself {
     pub account_id: String,
     #[serde(default)]
     pub display_name: String,
+}
+
+/// One entry of `GET /rest/api/3/field`, the site's field catalog.
+#[derive(Debug, Deserialize)]
+pub struct FieldInfo {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub schema: Option<Value>,
+}
+
+impl FieldInfo {
+    /// The field-type id of a custom field (e.g. `com.pyxis.greenhopper.jira:gh-sprint`).
+    pub fn schema_custom(&self) -> Option<&str> {
+        self.schema.as_ref()?.get("custom")?.as_str()
+    }
 }
 
 /// Jira's standard error body: `{"errorMessages": [...], "errors": {field: msg}}`.

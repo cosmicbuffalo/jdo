@@ -15,7 +15,7 @@ use serde_json::Value;
 
 use super::auth::Auth;
 use super::wire::{
-    BoardConfig, BoardInfo, CommentPage, ErrorBody, IssuePage, Myself, RawIssue, Sprint,
+    BoardConfig, BoardInfo, CommentPage, ErrorBody, FieldInfo, IssuePage, Myself, RawIssue, Sprint,
     SprintPage, TransitionList,
 };
 
@@ -269,6 +269,12 @@ impl JiraClient {
 
     /// Set fields on an issue: `fields` is `{field_id: value, ...}`.
     pub fn update_fields(&self, key: &str, fields: Value) -> std::result::Result<(), JiraError> {
+        // An unresolved custom field has an empty id (see `jira::fields`).
+        if fields.as_object().is_some_and(|f| f.contains_key("")) {
+            return Err(JiraError::message(
+                "jdo doesn't know this field's id on your site — run `jdo --fields` and pin it under [jira.fields]",
+            ));
+        }
         let url = self.url(&format!("/rest/api/3/issue/{key}"));
         self.write_json(self.http.put(url), &serde_json::json!({ "fields": fields }))
     }
@@ -283,6 +289,11 @@ impl JiraClient {
 
     pub fn myself(&self) -> Result<Myself> {
         self.get_json(&self.url("/rest/api/3/myself"), "current user")
+    }
+
+    /// The site's field catalog, used to find custom-field ids by name.
+    pub fn fields(&self) -> Result<Vec<FieldInfo>> {
+        self.get_json(&self.url("/rest/api/3/field"), "field catalog")
     }
 }
 

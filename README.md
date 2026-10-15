@@ -2,18 +2,19 @@
 
 A terminal UI client for **Jira** boards — see and work your team's board without leaving the terminal.
 
-`jdo` forks the TUI layer of [`tdo`](../tdo) (a git-backed kanban TUI) and drops the local storage backend entirely: all data comes from the Jira Cloud REST API. The goal is to replace day-to-day use of the Jira web GUI for the common flows — viewing the board, moving cards through statuses, editing key fields, creating cards, and reading comments.
+`jdo` forks the TUI layer of [`tdo`](https://github.com/cosmicbuffalo/tdo) (a git-backed kanban TUI) and drops the local storage backend entirely: all data comes from the Jira Cloud REST API. The goal is to replace day-to-day use of the Jira web GUI for the common flows — viewing the board, moving cards through statuses, editing key fields, creating cards, and reading comments.
 
-> **Status:** reads the live board, moves cards through the workflow, edits description / acceptance criteria, and creates cards. Writing comments, clipboard, auto-refresh and OAuth are still to come.
+> **Status:** reads the live board, moves cards through the workflow, edits description / acceptance criteria, and creates cards. Writing comments, clipboard, auto-refresh and OAuth are still to come. Design notes are in [`docs/DESIGN.md`](docs/DESIGN.md).
 
 ## Install
 
 ```sh
+cargo install --git https://github.com/cosmicbuffalo/jdo
+# or, from a clone:
 cargo install --path .
-export JIRA_EMAIL="you@example.com"
-export JIRA_API_TOKEN="…"   # Atlassian account → Security → API tokens
-jdo                          # or: jdo --board <id>
 ```
+
+Then follow [Setup](#setup) — jdo needs to know your Jira site, your board and your credentials before it can start.
 
 A running `jdo` notices when it is reinstalled and restarts itself into the new binary, keeping your grouping, folds and cursor.
 
@@ -27,7 +28,7 @@ A running `jdo` notices when it is reinstalled and restarts itself into the new 
 - **Details** — `Enter` opens a card: fields, description, acceptance criteria, comments.
 - **Editing** — in details, `e` enters edit mode: `j`/`k` walk the editable fields (title, status, assignee, story points, sprint, epic, description, acceptance criteria) and `Enter` changes the one under the cursor — a one-line input, or a type-to-filter list for assignee, sprint and epic. Status lists the statuses the card's workflow can move it to from where it is, like move mode; a transition with a screen opens its form. This works for cards that aren't on the board too. Each change saves to Jira on its own. Putting a ticket in the active sprint puts it on the board; moving a board card out of it takes it off. `a` still jumps straight to the acceptance criteria. Description and acceptance criteria are edited as Markdown (`Ctrl-G` for `$EDITOR`). Headings, lists, code, quotes, links and bold/italic round-trip; tables, mentions and the like are kept as `⟦n:…⟧` placeholders and restored on save.
 - **Move mode** — `m` loads the card's workflow; only columns it can legally move to light up. Transitions with screens open a form pre-filled with the issue's values; Jira's validator errors land on the offending fields.
-- **Create** — `c` opens a "Create new <PROJECT> ticket" dialog: Team and Sprint default to the board's, Epic (the section you're in, when grouped by epic) and Assignee (the team's members) are type-to-filter pickers, plus Title, Description and Acceptance Criteria. Jira's create rules mark required fields; its errors show under the fields they belong to.
+- **Create** — `c` opens a "Create new <PROJECT> ticket" dialog: Team (if your site has a Team field) and Sprint default to the board's, Epic (the section you're in, when grouped by epic) and Assignee (the team's members) are type-to-filter pickers, plus Title, Description and Acceptance Criteria. Jira's create rules mark required fields; its errors show under the fields they belong to.
 - **Mouse** — click to select, click again to open, `[×]` to close; footer hints and dialog buttons are clickable. `--no-mouse` keeps the terminal's own text selection.
 
 ## Keys
@@ -49,30 +50,95 @@ A running `jdo` notices when it is reinstalled and restarts itself into the new 
 | `?` | keymap |
 | `q` | quit |
 
-## Configuration
+## Setup
 
-**Board** — the only thing you normally choose. Highest priority first: `jdo --board <id>`, then `JDO_BOARD=<id>`, then `board_id` in the config file. The id is the number in the board's URL (`.../boards/<id>`).
+jdo works with **Jira Cloud** (`https://<your-site>.atlassian.net`). It needs three things.
 
-**Team, project and sprint** aren't configured — they come from the board: new cards go to the board's project, the create dialog defaults to the board's most common Team and its active sprint, and the Assignee list is that team's recent assignees. Switch boards and they all follow.
+### 1. Credentials
 
-**Credentials** come from the environment only (`JIRA_EMAIL`, `JIRA_API_TOKEN`), never the config file.
+Create an API token at <https://id.atlassian.com/manage-profile/security/api-tokens>, then export it with the email of your Atlassian account (e.g. in your shell profile):
 
-**Config file** — optional, not created for you: `~/.config/jdo/config.toml` (or `$XDG_CONFIG_HOME/jdo/config.toml`).
+```sh
+export JIRA_EMAIL="you@example.com"
+export JIRA_API_TOKEN="…"
+```
+
+Credentials are read from the environment only — never from the config file. The token acts as you, with your Jira permissions.
+
+### 2. Site and board
+
+Open your board in the browser. Its URL looks like
+
+```
+https://your-site.atlassian.net/jira/software/c/projects/ABC/boards/123
+```
+
+The part before `/jira` is your **site**; the number after `/boards/` is the **board id**. Put both in `~/.config/jdo/config.toml` (or `$XDG_CONFIG_HOME/jdo/config.toml`; jdo doesn't create it for you):
 
 ```toml
 [jira]
-base_url = "https://your-site.atlassian.net"   # or JIRA_BASE_URL
+base_url = "https://your-site.atlassian.net"
 board_id = 123
-
-[jira.fields]               # custom-field ids, only if your project differs
-story_points = "customfield_10016"
-acceptance_criteria = "customfield_10035"
-sprint = "customfield_10020"
-epic_link = "customfield_10014"
-team = "customfield_10001"
 ```
 
-`refresh_seconds` and `auth = "oauth"` are accepted but not implemented yet (press `r` to refresh; only API-token auth works).
+Either can come from elsewhere instead, highest priority first:
+
+| Setting | Command line | Environment | Config file |
+|---|---|---|---|
+| Site | — | `JIRA_BASE_URL` | `base_url` |
+| Board | `--board <id>` | `JDO_BOARD` | `board_id` |
+
+Project, team and sprint aren't configured — they come from the board: new cards go to the board's project, the create dialog defaults to the board's most common Team and its active sprint, and the Assignee list is that team's recent assignees. Switch boards and they all follow.
+
+### 3. Custom fields (usually automatic)
+
+Story points, acceptance criteria, sprint, epic link and team are *custom fields* whose ids differ from site to site. At startup jdo looks them up in your site's field catalog by type and name, so on most sites there's nothing to do. Check what it found with:
+
+```sh
+jdo --fields
+```
+
+```
+story_points         customfield_10028    auto-detected     Story Points
+                       also matches customfield_10016 (Story point estimate)
+acceptance_criteria  -                    not on this site
+sprint               customfield_10020    auto-detected     Sprint
+epic_link            customfield_10014    auto-detected     Epic Link
+team                 customfield_10001    auto-detected     Team
+```
+
+A field that's `not on this site` is simply left blank in jdo. If jdo picked the wrong one — common when a site has several fields with the same name — pin the right id:
+
+```toml
+[jira.fields]
+story_points = "customfield_10016"
+```
+
+`jdo --fields` lists every candidate it saw; for the full list, open `https://your-site.atlassian.net/rest/api/3/field` in a browser where you're signed in to Jira — each entry has an `id` and `name`. When every field is pinned, jdo skips the catalog lookup entirely.
+
+### Check it
+
+```sh
+jdo --dump    # print the board as text and exit — a quick check of auth, board and fields
+jdo           # open the TUI
+```
+
+### All options
+
+```toml
+[jira]
+base_url = "https://your-site.atlassian.net"   # required (or JIRA_BASE_URL)
+board_id = 123                                 # required (or JDO_BOARD / --board)
+
+[jira.fields]          # optional; each one left out is found automatically
+story_points = "customfield_NNNNN"
+acceptance_criteria = "customfield_NNNNN"
+sprint = "customfield_NNNNN"
+epic_link = "customfield_NNNNN"
+team = "customfield_NNNNN"
+```
+
+Unknown keys are reported rather than ignored, so a typo won't silently fall back. `refresh_seconds` and `auth = "oauth"` are accepted but not implemented yet (press `r` to refresh; only API-token auth works).
 
 ## License
 

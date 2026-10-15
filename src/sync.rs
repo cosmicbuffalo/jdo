@@ -111,6 +111,10 @@ pub fn field_list(fields: &FieldMap) -> Vec<&str> {
         "epic",
         "parent",
     ]
+    .into_iter()
+    // Fields this site doesn't have resolve to "".
+    .filter(|id| !id.is_empty())
+    .collect()
 }
 
 pub fn spawn(client: JiraClient, fields: FieldMap, browse_base: String) -> Worker {
