@@ -80,6 +80,29 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_create(frame, form, &app.user_colors, &mut hits);
         app.hits.extend(hits);
     }
+    narrow_emoji_presentation(frame.buffer_mut());
+}
+
+/// Drop the emoji-presentation selector (U+FE0F) wherever it widens a
+/// normally narrow character, e.g. `❄️` (U+2744 U+FE0F).
+///
+/// ratatui and tmux count such a pair as two columns, but terminals don't all
+/// agree — one that draws it in one column shifts the rest of the row left.
+/// The bare character is one column everywhere; the cell after it (blank,
+/// reserved for the wide glyph) becomes a visible space, so layout is
+/// unchanged. Done on the finished frame so every view is covered and Jira's
+/// text itself is never altered.
+fn narrow_emoji_presentation(buffer: &mut Buffer) {
+    for cell in buffer.content.iter_mut() {
+        let symbol = cell.symbol();
+        if !symbol.contains('\u{FE0F}') {
+            continue;
+        }
+        let bare: String = symbol.chars().filter(|&c| c != '\u{FE0F}').collect();
+        if bare.width() < symbol.width() {
+            cell.set_symbol(&bare);
+        }
+    }
 }
 
 fn draw_title(frame: &mut Frame, area: Rect, app: &App) {
@@ -2142,5 +2165,14 @@ mod tests {
     fn truncate_adds_ellipsis() {
         assert_eq!(truncate("hello world", 6), "hello…");
         assert_eq!(truncate("hi", 6), "hi");
+    }
+
+    #[test]
+    fn emoji_presentation_is_narrowed_without_moving_anything() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 12, 1));
+        buffer.set_string(0, 0, "❄️ab✅c⚠️|", Style::default());
+        narrow_emoji_presentation(&mut buffer);
+        let cells: Vec<&str> = (0..10).map(|x| buffer[(x, 0)].symbol()).collect();
+        assert_eq!(cells, ["❄", " ", "a", "b", "✅", " ", "c", "⚠", " ", "|"], "naturally wide ✅ is left alone");
     }
 }
