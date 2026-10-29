@@ -124,6 +124,7 @@ pub fn map_issue(raw: &RawIssue, fields: &FieldMap, browse_base: &str) -> Issue 
         }),
         epic: epic_of(f, fields),
         url: format!("{}/browse/{}", browse_base.trim_end_matches('/'), raw.key),
+        updated: f.get("updated").and_then(Value::as_str).map(str::to_string),
         sync_state: Default::default(),
     }
 }

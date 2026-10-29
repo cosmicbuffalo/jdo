@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 /// `GET /rest/agile/1.0/board/{id}`
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct BoardInfo {
     /// `scrum` or `kanban` (or `simple` for team-managed boards).
     #[serde(rename = "type", default)]
@@ -18,7 +18,7 @@ pub struct BoardInfo {
 }
 
 /// `GET /rest/agile/1.0/board/{id}/configuration`
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct BoardConfig {
     pub name: String,
     #[serde(rename = "columnConfig")]
@@ -28,20 +28,20 @@ pub struct BoardConfig {
     pub sub_query: Option<SubQuery>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct SubQuery {
     #[serde(default)]
     pub query: String,
 }
 
 /// `GET /rest/agile/1.0/board/{id}/sprint`
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct SprintPage {
     #[serde(default)]
     pub values: Vec<Sprint>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Sprint {
     pub id: u64,
     pub name: String,
@@ -50,14 +50,14 @@ pub struct Sprint {
 }
 
 /// `GET /rest/agile/1.0/board/{id}` → `location`.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BoardLocation {
     #[serde(default)]
     pub project_key: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ColumnConfig {
     pub columns: Vec<BoardColumn>,
     /// WIP-limit mode: `none`, `issueCount`, or `issueCountExclSubs`.
@@ -65,7 +65,7 @@ pub struct ColumnConfig {
     pub constraint_type: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct BoardColumn {
     pub name: String,
     #[serde(default)]
@@ -77,13 +77,13 @@ pub struct BoardColumn {
     pub max: Option<u32>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct StatusRef {
     pub id: String,
 }
 
 /// `GET /rest/agile/1.0/board/{id}/issue` (paginated).
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IssuePage {
     #[serde(default)]
@@ -96,7 +96,7 @@ pub struct IssuePage {
     pub issues: Vec<RawIssue>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct RawIssue {
     pub key: String,
     #[serde(default)]
@@ -104,13 +104,13 @@ pub struct RawIssue {
 }
 
 /// `GET /rest/api/3/issue/{key}/transitions?expand=transitions.fields`
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct TransitionList {
     #[serde(default)]
     pub transitions: Vec<RawTransition>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RawTransition {
     pub id: String,
@@ -123,7 +123,7 @@ pub struct RawTransition {
     pub fields: serde_json::Map<String, Value>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct RawStatus {
     pub id: String,
     pub name: String,
@@ -134,13 +134,13 @@ fn default_true() -> bool {
 }
 
 /// `GET /rest/api/3/issue/{key}/comment`
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct CommentPage {
     #[serde(default)]
     pub comments: Vec<RawComment>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct RawComment {
     #[serde(default)]
     pub author: Value,
@@ -151,7 +151,7 @@ pub struct RawComment {
 }
 
 /// `GET /rest/api/3/myself`
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Myself {
     pub account_id: String,
@@ -160,7 +160,7 @@ pub struct Myself {
 }
 
 /// One entry of `GET /rest/api/3/field`, the site's field catalog.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct FieldInfo {
     pub id: String,
     #[serde(default)]
@@ -177,7 +177,7 @@ impl FieldInfo {
 }
 
 /// Jira's standard error body: `{"errorMessages": [...], "errors": {field: msg}}`.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ErrorBody {
     #[serde(default)]

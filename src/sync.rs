@@ -7,6 +7,7 @@
 
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -16,11 +17,14 @@ use crate::edit::EditField;
 use crate::find;
 use crate::jira::client::{JiraClient, JiraError};
 use crate::jira::mapping;
+use crate::jira::wire::{BoardConfig, BoardInfo};
 use crate::model::{Board, Comment, Issue, RawFields, RichField, SprintRef, Transition};
 
 /// UI → worker requests.
 pub enum Command {
-    LoadBoard { board_id: u64 },
+    /// The board's issues; its configuration and sprints come from a cache
+    /// (see [`BoardShape`]) unless `full`.
+    LoadBoard { board_id: u64, full: bool },
     /// Who the signed-in user is (asked at startup; again if that failed).
     FetchMyself,
     /// Workflow transitions from the issue's current status, plus the issue's
@@ -43,6 +47,8 @@ pub enum Command {
     Search { seq: u64, project: String, query: String },
     /// Set one field (value in Jira's shape); on success the issue is re-fetched.
     UpdateField { key: String, field: EditField, value: Value },
+    /// Re-fetch one issue (an open card that isn't on the board).
+    FetchIssue { key: String },
     Shutdown,
 }
 
@@ -58,6 +64,8 @@ pub enum Event {
     },
     TransitionDone { key: String, result: Result<(), JiraError> },
     IssueRefreshed(Issue),
+    /// An issue re-fetched by [`Command::FetchIssue`]; failures are dropped.
+    IssueFetched(Issue),
     Comments { key: String, result: Result<Vec<Comment>, String> },
     /// `(description, acceptance criteria)` as ADF.
     Rich { key: String, result: Result<(Value, Value), String> },
@@ -103,6 +111,7 @@ pub fn field_list(fields: &FieldMap) -> Vec<&str> {
         "priority",
         "labels",
         "description",
+        "updated",
         fields.story_points.as_str(),
         fields.acceptance_criteria.as_str(),
         fields.sprint.as_str(),
@@ -142,13 +151,14 @@ fn run(
         client.myself()
     });
     let _ = evt_tx.send(myself_event(me));
+    let mut shape: Option<BoardShape> = None;
 
     while let Ok(cmd) = cmd_rx.recv() {
         let event = match cmd {
             Command::Shutdown => break,
             Command::FetchMyself => myself_event(client.myself()),
-            Command::LoadBoard { board_id } => {
-                match load_board(&client, &fields, &browse_base, board_id) {
+            Command::LoadBoard { board_id, full } => {
+                match load_cached(&client, &fields, &browse_base, &mut shape, board_id, full) {
                     Ok(board) => Event::Board(board),
                     Err(err) => Event::BoardError(format!("{err:#}")),
                 }
@@ -172,6 +182,11 @@ fn run(
                     Err(_) => continue,
                 }
             }
+            Command::FetchIssue { key } => match client.issue(&key, &field_list(&fields)) {
+                Ok(raw) => Event::IssueFetched(mapping::map_issue(&raw, &fields, &browse_base)),
+                // Auto-refresh tries again on its next pass.
+                Err(_) => continue,
+            },
             Command::FetchRich { key } => {
                 let ids = ["description", fields.acceptance_criteria.as_str()];
                 let result = client
@@ -261,23 +276,83 @@ fn myself_event(result: anyhow::Result<crate::jira::wire::Myself>) -> Event {
 
 /// Load what the Jira web board shows: the active sprint(s) for scrum boards,
 /// otherwise the board's issues narrowed by its sub-filter (kanban).
+/// How long auto-refresh reuses a [`BoardShape`] before fetching it again.
+const SHAPE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// The parts of a board that rarely change — its configuration, type,
+/// project and open sprints — kept so auto-refresh only re-fetches issues.
+pub struct BoardShape {
+    board_id: u64,
+    config: BoardConfig,
+    info: BoardInfo,
+    sprints: Vec<SprintRef>,
+    fetched: Instant,
+}
+
+impl BoardShape {
+    pub fn fetch(client: &JiraClient, board_id: u64) -> anyhow::Result<Self> {
+        let config = client.board_configuration(board_id)?;
+        let info = client.board_info(board_id)?;
+        let sprints = if info.board_type == "scrum" {
+            client
+                .open_sprints(board_id)?
+                .into_iter()
+                .map(|s| SprintRef { active: s.state == "active", id: s.id, name: s.name })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Ok(Self { board_id, config, info, sprints, fetched: Instant::now() })
+    }
+
+    fn fresh(&self, board_id: u64) -> bool {
+        self.board_id == board_id && self.fetched.elapsed() < SHAPE_TTL
+    }
+}
+
+/// Fetch a board from scratch.
 pub fn load_board(
     client: &JiraClient,
     fields: &FieldMap,
     browse_base: &str,
     board_id: u64,
 ) -> anyhow::Result<Board> {
-    let config = client.board_configuration(board_id)?;
-    let info = client.board_info(board_id)?;
+    load_issues(client, fields, browse_base, &BoardShape::fetch(client, board_id)?)
+}
+
+/// Fetch a board, reusing `shape` unless `full` asks for everything or it's
+/// stale. Any failure drops the cache, so the next load (after the UI's
+/// backoff) starts from scratch — in case, say, the sprint was deleted.
+fn load_cached(
+    client: &JiraClient,
+    fields: &FieldMap,
+    browse_base: &str,
+    shape: &mut Option<BoardShape>,
+    board_id: u64,
+    full: bool,
+) -> anyhow::Result<Board> {
+    if full || !shape.as_ref().is_some_and(|s| s.fresh(board_id)) {
+        *shape = None;
+        *shape = Some(BoardShape::fetch(client, board_id)?);
+    }
+    let result = load_issues(client, fields, browse_base, shape.as_ref().expect("fetched above"));
+    if result.is_err() {
+        *shape = None;
+    }
+    result
+}
+
+/// The board's issues, laid out by its `shape`.
+fn load_issues(
+    client: &JiraClient,
+    fields: &FieldMap,
+    browse_base: &str,
+    shape: &BoardShape,
+) -> anyhow::Result<Board> {
+    let board_id = shape.board_id;
     let list = field_list(fields);
-    let mut sprints = Vec::new();
-    let (scope, raw) = if info.board_type == "scrum" {
-        sprints = client
-            .open_sprints(board_id)?
-            .into_iter()
-            .map(|s| SprintRef { active: s.state == "active", id: s.id, name: s.name })
-            .collect();
-        let active: Vec<&SprintRef> = sprints.iter().filter(|s| s.active).collect();
+    let (scope, raw) = if shape.info.board_type == "scrum" {
+        let active: Vec<&SprintRef> = shape.sprints.iter().filter(|s| s.active).collect();
         let mut raw = Vec::new();
         for sprint in &active {
             raw.extend(client.sprint_issues(board_id, sprint.id, &list)?);
@@ -289,11 +364,11 @@ pub fn load_board(
         };
         (scope, raw)
     } else {
-        let sub_query = config.sub_query.as_ref().map(|q| q.query.trim()).filter(|q| !q.is_empty());
+        let sub_query = shape.config.sub_query.as_ref().map(|q| q.query.trim()).filter(|q| !q.is_empty());
         (String::new(), client.board_issues(board_id, &list, sub_query)?)
     };
-    let project = info.location.project_key;
-    Ok(mapping::build_board(config, scope, project, sprints, raw, fields, browse_base))
+    let project = shape.info.location.project_key.clone();
+    Ok(mapping::build_board(shape.config.clone(), scope, project, shape.sprints.clone(), raw, fields, browse_base))
 }
 
 /// Tickets for the finder: the issue the query names (if it exists), then

@@ -4,7 +4,7 @@ A terminal UI client for **Jira** boards — see and work your team's board with
 
 `jdo` forks the TUI layer of [`tdo`](https://github.com/cosmicbuffalo/tdo) (a git-backed kanban TUI) and drops the local storage backend entirely: all data comes from the Jira Cloud REST API. The goal is to replace day-to-day use of the Jira web GUI for the common flows — viewing the board, moving cards through statuses, editing key fields, creating cards, and reading comments.
 
-> **Status:** reads the live board, moves cards through the workflow, edits description / acceptance criteria, and creates cards. Writing comments, clipboard, auto-refresh and OAuth are still to come. Design notes are in [`docs/DESIGN.md`](docs/DESIGN.md).
+> **Status:** reads the live board, moves cards through the workflow, edits description / acceptance criteria, and creates cards. Writing comments, clipboard and OAuth are still to come. Design notes are in [`docs/DESIGN.md`](docs/DESIGN.md).
 
 ## Install
 
@@ -25,6 +25,7 @@ A running `jdo` notices when it is reinstalled and restarts itself into the new 
 - **Grouping** — `g` cycles none → epic → assignee. Each group is a foldable section with a complete board of its own.
 - **Only mine** — `a` on the board shows only cards assigned to you (press again for everyone's); works with grouping and survives a reinstall restart.
 - **Find** — `f` finds any ticket in the board's project, on the board or not: type a key (`1234` or `ABC-1234`) or words from its title, description or comments. Board cards match instantly (fuzzy, on key + title) while Jira's text search fills in as you pause; `↑`/`↓` pick, `Enter` opens it just like a board card, and closing the details returns to the results. An empty query lists the tickets you created, newest first; `●` marks cards already on the board.
+- **Live board** — the board refreshes itself every 5 seconds while you're using jdo and every 30 seconds after a minute without a key press or mouse event, keeping your cursor on the same card. It re-fetches only the cards; the board's columns and sprints are reused for up to a day, so after a sprint starts or the board's settings change, press `r`. An open card that leaves the board stays open, and one that changes in Jira (its `updated` time moves, which includes new comments) reloads its description, acceptance criteria and comments. Changes you make from jdo don't trigger those reloads. Failed refreshes back off (up to 5 minutes) so a rate-limited Jira gets breathing room.
 - **Details** — `Enter` opens a card: fields, description, acceptance criteria, comments.
 - **Editing** — in details, `e` enters edit mode: `j`/`k` walk the editable fields (title, status, assignee, story points, sprint, epic, description, acceptance criteria) and `Enter` changes the one under the cursor — a one-line input, or a type-to-filter list for assignee, sprint and epic. Status lists the statuses the card's workflow can move it to from where it is, like move mode; a transition with a screen opens its form. This works for cards that aren't on the board too. Each change saves to Jira on its own. Putting a ticket in the active sprint puts it on the board; moving a board card out of it takes it off. `a` still jumps straight to the acceptance criteria. Description and acceptance criteria are edited as Markdown (`Ctrl-G` for `$EDITOR`). Headings, lists, code, quotes, links and bold/italic round-trip; tables, mentions and the like are kept as `⟦n:…⟧` placeholders and restored on save.
 - **Move mode** — `m` loads the card's workflow; only columns it can legally move to light up. Transitions with screens open a form pre-filled with the issue's values; Jira's validator errors land on the offending fields.
@@ -46,7 +47,7 @@ A running `jdo` notices when it is reinstalled and restarts itself into the new 
 | `a` | on the board: show only your cards / everyone's |
 | `z` / `Z` | fold the section / all sections |
 | `Home` / `End` | first / last card |
-| `r` | refresh |
+| `r` | refresh now, including the board's columns and sprints |
 | `?` | keymap |
 | `q` | quit |
 
@@ -129,6 +130,8 @@ jdo           # open the TUI
 [jira]
 base_url = "https://your-site.atlassian.net"   # required (or JIRA_BASE_URL)
 board_id = 123                                 # required (or JDO_BOARD / --board)
+refresh_seconds = 30          # auto-refresh period when idle; 0 turns auto-refresh off
+active_refresh_seconds = 5    # auto-refresh period while you're using jdo
 
 [jira.fields]          # optional; each one left out is found automatically
 story_points = "customfield_NNNNN"
@@ -138,7 +141,7 @@ epic_link = "customfield_NNNNN"
 team = "customfield_NNNNN"
 ```
 
-Unknown keys are reported rather than ignored, so a typo won't silently fall back. `refresh_seconds` and `auth = "oauth"` are accepted but not implemented yet (press `r` to refresh; only API-token auth works).
+Unknown keys are reported rather than ignored, so a typo won't silently fall back. `auth = "oauth"` is accepted but not implemented yet (only API-token auth works).
 
 ## License
 

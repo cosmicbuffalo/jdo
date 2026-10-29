@@ -98,10 +98,11 @@ fn main() -> Result<()> {
     let worker = sync::spawn(client, fields, cfg.base_url.clone());
     worker
         .tx
-        .send(Command::LoadBoard { board_id: cfg.board_id })
+        .send(Command::LoadBoard { board_id: cfg.board_id, full: true })
         .context("queue initial board load")?;
 
     let mut app = App::new(Board::default(), cfg.board_id);
+    app.auto_refresh = app::AutoRefresh::new(cfg.refresh_seconds, cfg.active_refresh_seconds);
     if let Ok(state) = std::env::var(reload::RESUME_VAR) {
         app.apply_resume(&state);
     }
@@ -149,6 +150,7 @@ fn run_event_loop(
                 SyncEvent::Transitions { key, result } => app.on_transitions(&key, result),
                 SyncEvent::TransitionDone { key, result } => app.on_transition_done(&key, result),
                 SyncEvent::IssueRefreshed(issue) => app.on_issue_refreshed(issue),
+                SyncEvent::IssueFetched(issue) => app.on_issue_fetched(issue),
                 SyncEvent::Comments { key, result } => app.on_comments(&key, result),
                 SyncEvent::Rich { key, result } => app.on_rich(&key, result),
                 SyncEvent::RichUpdated { key, field, result } => app.on_rich_updated(&key, field, result),
@@ -200,7 +202,7 @@ fn dispatch(
             }
         }
         Action::Quit => return true,
-        Action::Refresh => worker.send(Command::LoadBoard { board_id }),
+        Action::Refresh { full } => worker.send(Command::LoadBoard { board_id, full }),
         Action::FetchMyself => worker.send(Command::FetchMyself),
         Action::FetchTransitions(key) => worker.send(Command::FetchTransitions { key }),
         Action::SubmitTransition { key, body } => worker.send(Command::DoTransition { key, body }),
@@ -208,6 +210,7 @@ fn dispatch(
             worker.send(Command::FetchComments { key: key.clone() });
             worker.send(Command::FetchRich { key });
         }
+        Action::FetchIssue(key) => worker.send(Command::FetchIssue { key }),
         Action::SaveRich { key, field, value } => worker.send(Command::UpdateRich { key, field, value }),
         Action::FetchCreateMeta(project) => worker.send(Command::FetchCreateMeta { project }),
         Action::FetchTeamMembers(team_id) => worker.send(Command::FetchTeamMembers { team_id }),

@@ -15,8 +15,11 @@ web UI for one board.
 - **No async runtime.** The event loop stays synchronous. A background worker
   thread (`sync.rs`) runs a blocking HTTP client and talks to the UI over two
   `mpsc` channels (UI → worker `Command`s, worker → UI `Event`s), drained at the
-  top of each loop iteration. Network calls happen only in response to user
-  actions — never on the input tick.
+  top of each loop iteration. Network calls happen in response to user
+  actions, plus a timed board refresh (`AutoRefresh` in `app.rs`): every
+  `active_refresh_seconds` (5) within a minute of the last input, every
+  `refresh_seconds` (30) otherwise, one load at a time, doubling the wait
+  after each failed load (capped at 5 minutes).
 - **Typed writes.** Each mutation is its own command — workflow transition,
   field update, create — sent to the worker; Jira's validation errors come back
   structured and land on the fields they belong to.
@@ -52,4 +55,14 @@ prints the outcome, including ambiguous matches worth pinning.
   site's policy before using jdo there.
 - Writes go to your real Jira. Try transitions and edits on a throwaway issue
   first when changing write paths.
-- Auto-refresh (when added) must stay modest and back off on HTTP 429.
+- Auto-refresh must stay modest. The worker caches the board's shape (board
+  configuration, board info, open sprints; `BoardShape` in `sync.rs`) for 24
+  hours, so a timed refresh is just the issues, usually one request; `r`, the
+  first load and any failed load fetch the shape again. Failed loads, HTTP 429
+  included, back off.
+- Open details reload their comments and rich text only when the card's
+  `updated` timestamp moves forward (an open card off the board is re-fetched on
+  the same timer). Our own writes are recorded with the time Jira confirmed
+  them (`written` in `app.rs`): a board asked for before that is older than our
+  copy, so our copy wins, and the first board after it shows our change, so its
+  new timestamp doesn't count as an outside edit.

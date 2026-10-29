@@ -108,6 +108,9 @@ pub struct Issue {
     pub epic: Option<EpicRef>,
     /// Browser URL for the issue (used by copy-to-clipboard).
     pub url: String,
+    /// Jira's last-modified timestamp, as sent; a change means someone edited
+    /// the issue (including its comments).
+    pub updated: Option<String>,
     pub sync_state: SyncState,
 }
 

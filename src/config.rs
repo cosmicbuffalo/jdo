@@ -20,7 +20,11 @@ pub struct JiraConfig {
     pub auth: AuthKind,
     /// Board id, from the board URL `.../boards/<id>`.
     pub board_id: u64,
+    /// Auto-refresh period while you're away from the keyboard; 0 turns
+    /// auto-refresh off.
     pub refresh_seconds: u64,
+    /// Auto-refresh period while you're using jdo.
+    pub active_refresh_seconds: u64,
     pub fields: FieldOverrides,
 }
 
@@ -33,6 +37,7 @@ struct FileConfig {
     auth: AuthKind,
     board_id: Option<u64>,
     refresh_seconds: Option<u64>,
+    active_refresh_seconds: Option<u64>,
     fields: FieldOverrides,
 }
 
@@ -123,7 +128,8 @@ pub fn load(cli_board: Option<u64>) -> Result<JiraConfig> {
         base_url,
         auth: file.auth,
         board_id,
-        refresh_seconds: file.refresh_seconds.unwrap_or(25),
+        refresh_seconds: file.refresh_seconds.unwrap_or(30),
+        active_refresh_seconds: file.active_refresh_seconds.unwrap_or(5),
         fields: file.fields,
     })
 }

@@ -28,13 +28,16 @@ use tui_textarea::TextArea;
 pub enum Action {
     None,
     Quit,
-    Refresh,
+    /// Reload the board; `full` re-fetches its configuration and sprints too.
+    Refresh { full: bool },
     /// Ask Jira who the signed-in user is.
     FetchMyself,
     FetchTransitions(String),
     SubmitTransition { key: String, body: Value },
     /// Load what the details view needs: comments and the rich-text fields.
     FetchDetails(String),
+    /// Re-fetch one issue quietly (an open card that isn't on the board).
+    FetchIssue(String),
     SaveRich { key: String, field: RichField, value: Value },
     /// Hand the open field editor's text to `$EDITOR`.
     EditExternally,
@@ -190,6 +193,78 @@ pub enum StatusLevel {
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 pub const SPINNER_INTERVAL: Duration = Duration::from_millis(80);
 
+/// You count as using jdo for this long after your last key press or mouse event.
+const ACTIVE_WINDOW: Duration = Duration::from_secs(60);
+/// The longest auto-refresh backs off to while board loads keep failing.
+const MAX_BACKOFF: Duration = Duration::from_secs(300);
+
+/// When to re-fetch the board unasked: often while you're using jdo, rarely
+/// while you're away, and less and less often while loads fail (Jira
+/// rate-limiting with HTTP 429, say).
+pub struct AutoRefresh {
+    /// `None`: auto-refresh is off.
+    idle: Option<Duration>,
+    active: Duration,
+    last_input: Instant,
+    /// When the last board load came back.
+    last_load: Instant,
+    /// When the latest board load was asked for.
+    sent: Instant,
+    in_flight: bool,
+    failures: u32,
+}
+
+impl AutoRefresh {
+    /// Periods in seconds; an idle period of 0 turns auto-refresh off.
+    pub fn new(idle_secs: u64, active_secs: u64) -> Self {
+        let now = Instant::now();
+        Self {
+            idle: (idle_secs > 0).then(|| Duration::from_secs(idle_secs)),
+            active: Duration::from_secs(active_secs.max(1)),
+            last_input: now,
+            last_load: now,
+            sent: now,
+            in_flight: false,
+            failures: 0,
+        }
+    }
+
+    pub fn input(&mut self, now: Instant) {
+        self.last_input = now;
+    }
+
+    fn period(&self, now: Instant) -> Option<Duration> {
+        let idle = self.idle?;
+        let base = if now.saturating_duration_since(self.last_input) < ACTIVE_WINDOW {
+            self.active.min(idle)
+        } else {
+            idle
+        };
+        let backoff = base.saturating_mul(1 << self.failures.min(16));
+        Some(backoff.min(MAX_BACKOFF.max(base)))
+    }
+
+    /// Whether a refresh is due at `now`; if so it counts as started.
+    fn due(&mut self, now: Instant) -> bool {
+        if self.in_flight || self.period(now).is_none_or(|p| now.saturating_duration_since(self.last_load) < p) {
+            return false;
+        }
+        self.started(now);
+        true
+    }
+
+    fn started(&mut self, now: Instant) {
+        self.in_flight = true;
+        self.sent = now;
+    }
+
+    fn finished(&mut self, now: Instant, ok: bool) {
+        self.in_flight = false;
+        self.last_load = now;
+        self.failures = if ok { 0 } else { self.failures + 1 };
+    }
+}
+
 pub struct App {
     pub board: Board,
     pub board_id: u64,
@@ -198,6 +273,7 @@ pub struct App {
     pub load_error: Option<String>,
     /// A manual refresh is in flight (status line shows a spinner).
     pub refreshing: bool,
+    pub auto_refresh: AutoRefresh,
     started: Instant,
     /// Index into `board.columns`.
     pub selected_column: usize,
@@ -242,8 +318,15 @@ pub struct App {
     mine_pending: bool,
     /// Moves submitted without a form, awaiting Jira's verdict.
     in_flight: HashMap<String, PendingMove>,
-    /// A refreshed board that arrived mid-move; applied once the move settles.
-    deferred_board: Option<Board>,
+    /// A refreshed board that arrived mid-move, and when it was asked for;
+    /// applied once the move settles.
+    deferred_board: Option<(Board, Instant)>,
+    /// Cards we changed ourselves, and when Jira's copy came back (or the save
+    /// went through). A board asked for before then is older than our copy.
+    written: HashMap<String, Instant>,
+    /// The open card changed in Jira; its comments and rich text are re-fetched
+    /// on the next tick.
+    details_stale: Option<String>,
 }
 
 impl App {
@@ -254,6 +337,7 @@ impl App {
             board_loaded: false,
             load_error: None,
             refreshing: false,
+            auto_refresh: AutoRefresh::new(0, 0),
             started: Instant::now(),
             selected_column: 0,
             selected_row: 0,
@@ -280,6 +364,8 @@ impl App {
             mine_pending: false,
             in_flight: HashMap::new(),
             deferred_board: None,
+            written: HashMap::new(),
+            details_stale: None,
         }
     }
 
@@ -297,12 +383,29 @@ impl App {
     }
 
     /// Time-driven work, run every pass of the event loop: the finder's
-    /// search once typing pauses.
+    /// search once typing pauses, and auto-refresh.
     pub fn tick(&mut self) -> Action {
-        let Mode::Find(finder) = &mut self.mode else { return Action::None };
-        match finder.due(Instant::now()) {
-            Some((seq, query)) => Action::Search { seq, project: self.board.project_key.clone(), query },
-            None => Action::None,
+        let now = Instant::now();
+        let mut actions = Vec::new();
+        if let Mode::Find(finder) = &mut self.mode {
+            if let Some((seq, query)) = finder.due(now) {
+                actions.push(Action::Search { seq, project: self.board.project_key.clone(), query });
+            }
+        }
+        if self.board_loaded && self.auto_refresh.due(now) {
+            actions.push(Action::Refresh { full: false });
+            // The board refresh doesn't cover an open card that's off the board.
+            if let Some(key) = self.open_key().filter(|key| self.loose.contains_key(*key)) {
+                actions.push(Action::FetchIssue(key.to_string()));
+            }
+        }
+        if let Some(key) = self.details_stale.take().filter(|key| self.open_key() == Some(key.as_str())) {
+            actions.push(Action::FetchDetails(key));
+        }
+        match actions.len() {
+            0 => Action::None,
+            1 => actions.pop().unwrap(),
+            _ => Action::Many(actions),
         }
     }
 
@@ -694,10 +797,42 @@ impl App {
 
     /// Swap in a freshly fetched board, keeping the selected issue selected.
     pub fn on_board(&mut self, board: Board) {
+        self.auto_refresh.finished(Instant::now(), true);
+        let sent = self.auto_refresh.sent;
         if matches!(self.mode, Mode::Moving(_) | Mode::TransitionForm(..)) {
-            self.deferred_board = Some(board);
+            self.deferred_board = Some((board, sent));
             return;
         }
+        self.apply_board(board, sent);
+    }
+
+    /// Swap in a board that was asked for at `sent`.
+    fn apply_board(&mut self, board: Board, sent: Instant) {
+        // Auto-refresh happens unasked, so it doesn't announce itself.
+        let quiet = self.board_loaded && !self.refreshing;
+        // Cards we changed after this board was asked for: our copy is newer.
+        let ours: Vec<Issue> = self
+            .written
+            .iter()
+            .filter(|&(_, &at)| at > sent)
+            .filter_map(|(key, _)| lookup(&self.board, &self.loose, key).cloned())
+            .collect();
+        if let Some(key) = self.open_key() {
+            if let Some(new) = board.issue(key) {
+                let old = lookup(&self.board, &self.loose, key).and_then(|i| i.updated.as_deref());
+                // A change this board shows because we made it isn't news.
+                if !self.written.contains_key(key) && newer(old, new.updated.as_deref()) {
+                    self.details_stale = Some(key.to_string());
+                }
+            } else if let Some(issue) = self.board.issue(key) {
+                // A card that's open but left the board stays open, off the board.
+                self.loose.insert(key.to_string(), issue.clone());
+            }
+        }
+        // Writes this board already shows are settled; an open card off the
+        // board waits for its own re-fetch (see `on_issue_fetched`).
+        let open_loose = self.open_key().filter(|key| board.find(key).is_none()).map(str::to_string);
+        self.written.retain(|key, at| *at > sent || open_loose.as_ref() == Some(key));
         let selected = self.selected_issue().map(|i| i.key.clone());
         self.board = board;
         self.board_loaded = true;
@@ -712,6 +847,9 @@ impl App {
         self.load_error = None;
         let board = &self.board;
         self.loose.retain(|key, _| board.find(key).is_none());
+        for issue in ours {
+            self.apply_issue(issue);
+        }
         // Re-apply moves Jira hasn't confirmed yet so cards don't jump back.
         for pending in self.in_flight.values() {
             if let Some(issue) = self.board.issue_mut(&pending.key) {
@@ -729,12 +867,53 @@ impl App {
             self.selected_column = column.min(self.board.columns.len().saturating_sub(1));
             self.ensure_focus();
         }
-        if !matches!(&self.status, Some((m, _)) if m.starts_with("reloaded")) {
+        if quiet {
+            if matches!(&self.status, Some((m, StatusLevel::Error)) if m.starts_with("refresh failed")) {
+                self.status = None;
+            }
+        } else if !matches!(&self.status, Some((m, _)) if m.starts_with("reloaded")) {
             self.info(format!("{} issues", self.board.total_issues()));
         }
     }
 
+    /// An open card that's off the board, re-fetched by auto-refresh.
+    pub fn on_issue_fetched(&mut self, issue: Issue) {
+        let key = issue.key.clone();
+        if self.open_key() != Some(key.as_str()) || !self.loose.contains_key(&key) {
+            return;
+        }
+        match self.written.get(&key) {
+            // Fetched before our change landed; our copy is newer.
+            Some(&at) if at > self.auto_refresh.sent => return,
+            // The change is ours.
+            Some(_) => {
+                self.written.remove(&key);
+            }
+            None if newer(self.loose[&key].updated.as_deref(), issue.updated.as_deref()) => {
+                self.details_stale = Some(key);
+            }
+            None => {}
+        }
+        // Someone may have put it in the sprint, which puts it on the board.
+        self.apply_issue(issue);
+    }
+
+    /// The card whose details (or editors) are on screen.
+    fn open_key(&self) -> Option<&str> {
+        let mut mode = &self.mode;
+        while let Mode::Help { return_to } = mode {
+            mode = return_to;
+        }
+        match mode {
+            Mode::Details { key, .. } => Some(key),
+            Mode::EditFields(editor) => Some(&editor.key),
+            Mode::EditRich(editor) => Some(&editor.key),
+            _ => None,
+        }
+    }
+
     pub fn on_board_error(&mut self, message: String) {
+        self.auto_refresh.finished(Instant::now(), false);
         self.refreshing = false;
         if self.board_loaded {
             self.error(format!("refresh failed: {message}"));
@@ -860,6 +1039,7 @@ impl App {
     /// The authoritative issue after a successful transition (or create).
     pub fn on_issue_refreshed(&mut self, issue: Issue) {
         let key = issue.key.clone();
+        self.written.insert(key.clone(), Instant::now());
         let editing = match &mut self.mode {
             Mode::EditFields(editor) if editor.key == key => Some(editor),
             _ => None,
@@ -946,6 +1126,7 @@ impl App {
         }
         match result {
             Ok(value) => {
+                self.written.insert(key.to_string(), Instant::now());
                 let text = adf::to_text(Some(&value));
                 let (scroll, edit_cursor) = (editor.details_scroll, editor.edit_cursor);
                 if let Some(issue) = self.issue_mut(key) {
@@ -996,8 +1177,8 @@ impl App {
     /// Apply a board that arrived while a move was in progress.
     fn settle(&mut self) {
         if matches!(self.mode, Mode::Board | Mode::Details { .. } | Mode::Help { .. }) {
-            if let Some(board) = self.deferred_board.take() {
-                self.on_board(board);
+            if let Some((board, sent)) = self.deferred_board.take() {
+                self.apply_board(board, sent);
             }
         }
     }
@@ -1021,6 +1202,7 @@ impl App {
     // ----- keys ------------------------------------------------------------
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Action {
+        self.auto_refresh.input(Instant::now());
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return Action::Quit;
         }
@@ -1109,6 +1291,7 @@ impl App {
     // ----- mouse -----------------------------------------------------------
 
     pub fn handle_mouse(&mut self, event: MouseEvent) -> Action {
+        self.auto_refresh.input(Instant::now());
         let (x, y) = (event.column, event.row);
         match event.kind {
             MouseEventKind::Moved | MouseEventKind::Drag(_) => {
@@ -1259,13 +1442,14 @@ impl App {
             KeyCode::Char('a') => return self.toggle_mine(),
             KeyCode::Char('q') => return Action::Quit,
             KeyCode::Char('r') => {
+                self.auto_refresh.started(Instant::now());
                 if self.board_loaded {
                     self.refreshing = true;
                 } else {
                     // Retry a failed initial load; the spinner takes over again.
                     self.load_error = None;
                 }
-                return Action::Refresh;
+                return Action::Refresh { full: true };
             }
             KeyCode::Char('h') | KeyCode::Left => self.select_column(-1),
             KeyCode::Char('l') | KeyCode::Right => self.select_column(1),
@@ -1947,6 +2131,18 @@ enum Placement {
     Left,
 }
 
+/// Jira's `updated` timestamp moved forward (an older copy isn't a change).
+fn newer(old: Option<&str>, new: Option<&str>) -> bool {
+    let parse = |s: &str| chrono::DateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f%z").ok();
+    match (old, new) {
+        (Some(old), Some(new)) => match (parse(old), parse(new)) {
+            (Some(old), Some(new)) => new > old,
+            _ => old != new,
+        },
+        _ => false,
+    }
+}
+
 fn lookup<'a>(board: &'a Board, loose: &'a HashMap<String, Issue>, key: &str) -> Option<&'a Issue> {
     board.issue(key).or_else(|| loose.get(key))
 }
@@ -2526,4 +2722,132 @@ mod tests {
         assert!(app.folded.contains("epic:E-B"));
     }
 
+    #[test]
+    fn auto_refresh_is_frequent_while_active_and_slow_while_idle() {
+        let mut auto = AutoRefresh::new(30, 5);
+        let t0 = auto.last_load;
+        auto.input(t0);
+        assert!(!auto.due(t0 + Duration::from_secs(4)));
+        assert!(auto.due(t0 + Duration::from_secs(5)));
+        assert!(!auto.due(t0 + Duration::from_secs(6)), "one refresh at a time");
+        auto.finished(t0 + Duration::from_secs(6), true);
+        // A minute without input: idle, so 30s after the last load.
+        let idle = t0 + Duration::from_secs(70);
+        auto.finished(idle - Duration::from_secs(29), true);
+        assert!(!auto.due(idle));
+        assert!(auto.due(idle + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn auto_refresh_backs_off_while_loads_fail_and_can_be_off() {
+        let mut auto = AutoRefresh::new(30, 5);
+        let t0 = auto.last_load;
+        auto.input(t0);
+        auto.finished(t0, false);
+        auto.finished(t0, false);
+        assert!(!auto.due(t0 + Duration::from_secs(19)));
+        assert!(auto.due(t0 + Duration::from_secs(20)));
+        auto.finished(t0, true);
+        assert!(auto.due(t0 + Duration::from_secs(5)));
+
+        let mut off = AutoRefresh::new(0, 5);
+        assert!(!off.due(off.last_load + Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn background_refresh_is_quiet_and_keeps_an_open_card_that_left() {
+        let mut app = app();
+        app.info("hello");
+        let mut gone = app.board.clone();
+        gone.columns[0].issues.retain(|i| i.key != "A-1");
+        app.mode = Mode::Details { key: "A-1".into(), scroll: 0 };
+        app.on_board(gone);
+        assert_eq!(app.status.as_ref().map(|(m, _)| m.as_str()), Some("hello"));
+        assert!(lookup(&app.board, &app.loose, "A-1").is_some());
+    }
+
+    #[test]
+    fn an_edit_elsewhere_refetches_the_open_cards_details() {
+        let mut app = app();
+        app.board.columns[0].issues[0].updated = Some("t1".into());
+        app.mode = Mode::Details { key: "A-1".into(), scroll: 0 };
+        let mut same = app.board.clone();
+        app.on_board(same.clone());
+        assert!(matches!(app.tick(), Action::None), "unchanged: nothing to fetch");
+        same.columns[0].issues[0].updated = Some("t2".into());
+        app.on_board(same);
+        assert!(matches!(app.tick(), Action::FetchDetails(ref k) if k == "A-1"));
+        assert!(matches!(app.tick(), Action::None), "once");
+    }
+
+    #[test]
+    fn an_open_card_off_the_board_is_refetched_with_the_board() {
+        let mut app = app();
+        app.loose.insert("X-9".into(), Issue { key: "X-9".into(), updated: Some("t1".into()), ..Default::default() });
+        app.mode = Mode::Details { key: "X-9".into(), scroll: 0 };
+        app.auto_refresh = AutoRefresh::new(30, 5);
+        app.auto_refresh.last_load -= Duration::from_secs(10);
+        let Action::Many(actions) = app.tick() else { panic!("board and card") };
+        assert!(matches!(actions[..], [Action::Refresh { full: false }, Action::FetchIssue(ref k)] if k == "X-9"));
+        app.on_issue_fetched(Issue { key: "X-9".into(), summary: "new".into(), updated: Some("t2".into()), ..Default::default() });
+        assert_eq!(app.loose["X-9"].summary, "new");
+        assert!(matches!(app.tick(), Action::FetchDetails(ref k) if k == "X-9"));
+    }
+
+    #[test]
+    fn jira_timestamps_compare_by_time_not_text() {
+        let at = |s: &str| Some(s.to_string());
+        assert!(newer(at("2026-10-29T10:00:00.000+0000").as_deref(), at("2026-10-29T10:00:01.000+0000").as_deref()));
+        // Same instant in another offset, and an older copy: neither is a change.
+        assert!(!newer(at("2026-10-29T10:00:00.000+0000").as_deref(), at("2026-10-29T11:00:00.000+0100").as_deref()));
+        assert!(!newer(at("2026-10-29T10:00:01.000+0000").as_deref(), at("2026-10-29T10:00:00.000+0000").as_deref()));
+        assert!(!newer(None, at("2026-10-29T10:00:00.000+0000").as_deref()));
+    }
+
+    #[test]
+    fn our_own_save_does_not_refetch_the_details() {
+        let mut app = app();
+        app.board.columns[0].issues[0].updated = Some("t1".into());
+        app.mode = Mode::Details { key: "A-1".into(), scroll: 0 };
+        // Saving rich text tells us nothing about Jira's new timestamp.
+        app.written.insert("A-1".into(), Instant::now());
+        app.auto_refresh.started(Instant::now());
+        let mut after = app.board.clone();
+        after.columns[0].issues[0].updated = Some("t2".into());
+        app.on_board(after);
+        assert!(matches!(app.tick(), Action::None));
+        assert!(app.written.is_empty(), "settled once the board shows it");
+    }
+
+    #[test]
+    fn a_board_asked_for_before_our_change_does_not_undo_it() {
+        let mut app = app();
+        app.board.columns[0].status_ids = vec![String::new()];
+        app.auto_refresh.started(Instant::now());
+        let stale = app.board.clone();
+        let mut ours = app.board.issue("A-1").unwrap().clone();
+        ours.summary = "renamed".into();
+        app.on_issue_refreshed(ours);
+        app.on_board(stale);
+        assert_eq!(app.board.issue("A-1").unwrap().summary, "renamed");
+        // The next board, asked for after the change, is trusted again.
+        app.auto_refresh.started(Instant::now());
+        let mut next = app.board.clone();
+        next.columns[0].issues[0].summary = "renamed elsewhere".into();
+        app.on_board(next);
+        assert_eq!(app.board.issue("A-1").unwrap().summary, "renamed elsewhere");
+    }
+
+    #[test]
+    fn tick_refreshes_once_the_board_is_loaded() {
+        let mut fresh = App::new(Board::default(), 1);
+        fresh.auto_refresh = AutoRefresh::new(30, 5);
+        fresh.auto_refresh.last_load -= Duration::from_secs(10);
+        assert!(matches!(fresh.tick(), Action::None), "not before the first load");
+        let mut app = app();
+        app.auto_refresh = AutoRefresh::new(30, 5);
+        app.auto_refresh.last_load -= Duration::from_secs(10);
+        assert!(matches!(app.tick(), Action::Refresh { full: false }));
+        assert!(matches!(app.tick(), Action::None));
+    }
 }
